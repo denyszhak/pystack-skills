@@ -2,19 +2,7 @@
 
 Opinionated agent skills for typed Python backend services.
 
-PyStack is a repo-owned skill set for AI coding agents such as Claude Code, Codex, OpenCode, and Cursor. It encodes one practical backend shape for modern typed Python services so agents, reviewers, and teams know what kind of code to expect.
-
-It is not a framework, starter template, or claim about all Python. It is versioned guidance for a common service stack:
-
-| Layer | Choice |
-|---|---|
-| HTTP API | FastAPI |
-| Schemas and settings | Pydantic v2 |
-| Persistence | SQLAlchemy 2.0 async |
-| Database | PostgreSQL |
-| Tests | pytest, real Postgres, protocol-level external doubles |
-| Clients and logging | httpx, structlog |
-| Tooling | uv, ruff, ty |
+PyStack is a repo-owned skill set for AI coding agents such as Claude Code, Codex, OpenCode, and Cursor. It encodes one practical backend shape for a common modern Python service stack so agents, reviewers, and teams know what kind of code to expect.
 
 If your style differs, install the subset that matches yours and skip the rest.
 
@@ -132,6 +120,20 @@ description: |
 ```
 
 Tool-specific fields can be added at install time. See each tool's install doc.
+
+## Target Stack
+
+PyStack is not a framework, starter template, or claim about all Python. It is versioned guidance for this service stack:
+
+| Layer | Choice |
+|---|---|
+| HTTP API | FastAPI |
+| Schemas and settings | Pydantic v2 |
+| Persistence | SQLAlchemy 2.0 async |
+| Database | PostgreSQL |
+| Tests | pytest, real Postgres, protocol-level external doubles |
+| Clients and logging | httpx, structlog |
+| Tooling | uv, ruff, ty |
 
 ## License
 
