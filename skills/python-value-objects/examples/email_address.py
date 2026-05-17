@@ -1,9 +1,3 @@
-"""EmailAddress — validation in __post_init__, case-insensitive equality.
-
-Shows when to override __eq__/__hash__ (case-insensitive matching) while keeping
-the dataclass benefits.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass

@@ -1,14 +1,3 @@
-"""Stateful httpx.MockTransport handler for OpenAIClient.
-
-Usage in tests:
-
-    mock = OpenAIMock()
-    mock.set_chat_response({"choices": [{"message": {"content": "hello"}}]})
-    http = httpx.AsyncClient(transport=httpx.MockTransport(mock), base_url="https://x")
-    client = OpenAIClient(http=http, config=OpenAIConfig(MODEL="gpt-x"))
-    answer = await client.chat([ChatMessage(role="user", content="hi")])
-"""
-
 from __future__ import annotations
 
 from typing import Any

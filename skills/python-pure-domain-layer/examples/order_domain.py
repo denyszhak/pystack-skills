@@ -1,9 +1,3 @@
-"""Pure domain Order aggregate — Cosmic Python style.
-
-Framework-free. Sync. Behavior + invariants + events on the aggregate.
-Imports stdlib only.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field

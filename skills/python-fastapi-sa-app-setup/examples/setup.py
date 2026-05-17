@@ -1,10 +1,3 @@
-"""Canonical app/setup.py — the spine of a FastAPI + SA service.
-
-Lifespan opens app-lifetime resources (db pool, http clients) on app.state.
-provide_app(config) is the test-friendly factory.
-Module bottom creates the ASGI `app` for `uvicorn app.setup:app`.
-"""
-
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
@@ -38,9 +31,6 @@ class ErrorSchema(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Initialize resources in order; AsyncExitStack guarantees cleanup of any
-    partially-initialized state if a later init raises.
-    """
     config: AppConfig = app.state.config
     async with AsyncExitStack() as stack:
         await init_db_pool(app, config.db)

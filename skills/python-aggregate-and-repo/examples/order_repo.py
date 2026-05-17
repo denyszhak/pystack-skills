@@ -1,10 +1,3 @@
-"""Canonical repo for the Order aggregate.
-
-Takes session in constructor. Returns SA model instances.
-YAGNI: only methods a service currently calls.
-No commit or begin anywhere — the top-level service owns the transaction boundary.
-"""
-
 from __future__ import annotations
 
 from collections.abc import AsyncIterator

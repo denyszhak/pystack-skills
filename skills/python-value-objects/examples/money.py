@@ -1,9 +1,3 @@
-"""Canonical Money value object.
-
-frozen + slots + kw_only. Invariants in __post_init__. Behavior as methods.
-Equality and hashability are automatic from frozen=True.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass

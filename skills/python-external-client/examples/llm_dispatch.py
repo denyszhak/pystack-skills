@@ -1,10 +1,3 @@
-"""LLMClient Protocol + provider dispatch.
-
-Lives at app/clients/llm.py. Services depend on the Protocol; the concrete
-provider is chosen by config and wired in at lifespan. Swap providers by
-flipping LLM_PROVIDER in env — services don't change.
-"""
-
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
@@ -19,8 +12,6 @@ from app.schemas.llm import ChatMessage
 
 
 class LLMClient(Protocol):
-    """Provider-agnostic LLM contract. Services depend on this, never on concrete clients."""
-
     async def chat(self, messages: list[ChatMessage], *, model: str | None = None) -> str: ...
     async def close(self) -> None: ...
 

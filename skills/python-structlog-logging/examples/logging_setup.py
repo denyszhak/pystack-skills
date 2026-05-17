@@ -1,9 +1,3 @@
-"""Canonical app/common/logging.py.
-
-configure_logging(env=...) sets up structlog with a ContextVar-based
-correlation_id and bridges stdlib logging into the same stream.
-"""
-
 from __future__ import annotations
 
 import contextvars

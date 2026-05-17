@@ -1,5 +1,3 @@
-"""BaseHTTPClient — shared retry policy + http pool + from_config factory."""
-
 from __future__ import annotations
 
 from typing import Any, Literal, Self
@@ -25,10 +23,6 @@ class BaseHTTPClient:
 
     @classmethod
     def from_config(cls, config: BaseHTTPClientConfig) -> Self:
-        """Production constructor — builds the httpx.AsyncClient from config.
-
-        Tests should call the regular __init__ with a mock-transport httpx client.
-        """
         http = httpx.AsyncClient(
             base_url=config.BASE_URL,
             timeout=config.TIMEOUT,

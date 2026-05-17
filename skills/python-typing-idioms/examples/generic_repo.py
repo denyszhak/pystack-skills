@@ -1,5 +1,3 @@
-"""PEP 695 generic repository — typed by aggregate."""
-
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
@@ -12,8 +10,6 @@ class HasId(Protocol):
 
 
 class Repo[T: HasId]:
-    """Generic repo bound to anything with an `id: UUID`."""
-
     async def get(self, id: UUID) -> T | None:
         raise NotImplementedError
 

@@ -1,9 +1,3 @@
-"""Canonical tests/conftest.py.
-
-Session-scoped: config, db setup, app (with manual app.state).
-Function-scoped: client (httpx ASGITransport), session.
-"""
-
 from __future__ import annotations
 
 import asyncio

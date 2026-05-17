@@ -1,5 +1,3 @@
-"""Canonical schemas for the Order resource — cohesion methods, *Get / *Command naming."""
-
 from __future__ import annotations
 
 from decimal import Decimal

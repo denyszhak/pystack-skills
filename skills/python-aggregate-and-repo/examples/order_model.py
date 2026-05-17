@@ -1,10 +1,3 @@
-"""Canonical aggregate: Order + OrderLine.
-
-Behavior on the SA model. Invariants enforced via method preconditions.
-Derived values via @property. Domain exceptions next to the class.
-Table names are singular (order, order_line, customer).
-"""
-
 from __future__ import annotations
 
 from datetime import UTC, datetime

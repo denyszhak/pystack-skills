@@ -1,10 +1,3 @@
-"""CorrelationIDMiddleware + logging_middleware.
-
-CorrelationIDMiddleware sets the ContextVar so every log line in the request
-includes correlation_id automatically. logging_middleware emits structured
-start/end events.
-"""
-
 from __future__ import annotations
 
 import time

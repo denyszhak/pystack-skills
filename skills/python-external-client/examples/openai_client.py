@@ -1,14 +1,3 @@
-"""OpenAIClient — concrete LLM client wrapping the OpenAI chat completions API.
-
-Inherits BaseHTTPClient. One method per API call a service needs (YAGNI).
-Domain exceptions next to the class.
-
-The provider-agnostic LLMClient Protocol (in app/clients/llm.py) declares the
-contract services depend on. Services never import OpenAIClient directly —
-they receive an LLMClient via FastAPI Depends, and the dispatch at app setup
-decides which concrete provider class is wired in.
-"""
-
 from __future__ import annotations
 
 import httpx
@@ -24,7 +13,7 @@ from app.schemas.llm import ChatMessage   # role + content; lives in app/schemas
 
 
 class RateLimitedException(AppException):
-    """429 from upstream. Lives in app/common/exceptions.py in production."""
+    pass
 
 
 class OpenAIAuthException(NotAuthenticatedException):
@@ -38,8 +27,6 @@ class OpenAIRateLimitedException(RateLimitedException):
 
 
 class OpenAIClient(BaseHTTPClient):
-    """Satisfies the LLMClient Protocol implicitly (chat + close)."""
-
     async def chat(
         self,
         messages: list[ChatMessage],

@@ -1,9 +1,3 @@
-"""Canonical service class — orchestrates aggregate + client + session.
-
-Deps via kw-only constructor. Returns Pydantic schemas. Owns transaction boundary.
-Raises typed exceptions (translated to HTTP by global handlers).
-"""
-
 from __future__ import annotations
 
 from sqlalchemy.ext.asyncio import AsyncSession
