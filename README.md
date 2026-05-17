@@ -14,6 +14,8 @@ Generic prompts like "follow DDD" or "use clean architecture" help a little, but
 
 PyStack turns team taste into repo-owned, reviewable guidance. The goal is not to make every prompt longer. The goal is to define the relationships between the pieces once so agents can do better work without every request restating the architecture.
 
+The useful part is that this guidance is yours. Fork it, delete what you disagree with, rewrite the trade-offs, add your own examples, and keep the resulting agent behavior visible in the same place as the code it shapes.
+
 ## Architecture Stance
 
 PyStack is pragmatic tactical DDD for one Python backend service.
