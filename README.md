@@ -1,4 +1,4 @@
-# PyStack
+# PyStack Skills
 
 ![PyStack Skills Logo](assets/logo.png)
 
@@ -32,7 +32,17 @@ PyStack is pragmatic tactical DDD for one Python backend service.
 - Tests use real Postgres for persistence and purpose-built doubles for external systems.
 - Protocols/interfaces are added when they earn their keep, not for every repo/client by default.
 
-The influences are [Cosmic Python](https://www.cosmicpython.com/), [Python Patterns](https://python-patterns.guide/), Evans-style DDD, Fowler's writing on [testing](https://martinfowler.com/testing/) and [mocks vs stubs](https://martinfowler.com/articles/mocksArentStubs.html), plus the official docs for [Python](https://docs.python.org/3/), [FastAPI](https://fastapi.tiangolo.com/), [Pydantic](https://docs.pydantic.dev/), and [SQLAlchemy](https://docs.sqlalchemy.org/).
+Influences and references:
+
+- [Cosmic Python](https://www.cosmicpython.com/)
+- [Python Patterns](https://python-patterns.guide/)
+- [Domain-Driven Design Reference by Eric Evans](https://www.domainlanguage.com/ddd/reference/)
+- Martin Fowler on [testing](https://martinfowler.com/testing/)
+- Martin Fowler on [mocks vs stubs](https://martinfowler.com/articles/mocksArentStubs.html)
+- [Python documentation](https://docs.python.org/3/)
+- [FastAPI documentation](https://fastapi.tiangolo.com/)
+- [Pydantic documentation](https://docs.pydantic.dev/)
+- [SQLAlchemy documentation](https://docs.sqlalchemy.org/)
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the locked decisions and trade-offs.
 
