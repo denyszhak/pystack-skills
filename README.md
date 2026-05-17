@@ -1,5 +1,7 @@
 # PyStack
 
+![PyStack Skills Logo](assets/logo.png)
+
 Opinionated agent skills for typed Python backend services.
 
 PyStack is a repo-owned skill set for AI coding agents such as Claude Code, Codex, OpenCode, and Cursor. It encodes one practical backend shape for a common modern Python service stack so agents, reviewers, and teams know what kind of code to expect.
