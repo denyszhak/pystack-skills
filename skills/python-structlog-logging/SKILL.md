@@ -10,6 +10,10 @@ description: |
   fields not f-strings.
   Do NOT use for: print-debugging in scripts; CLI output (use rich or stdout
   directly).
+license: MIT
+compatibility: Python 3.12+ services using FastAPI and structlog.
+metadata:
+  tier: service
 ---
 
 # Logging with structlog

@@ -6,10 +6,15 @@ description: |
   imports of `itertools`, `collections.abc`; on `for ... yield ...`, `__iter__`,
   generators; on tree-shaped data, leaf/composite distinctions, recursive
   traversal. Encodes: generators over hand-rolled iterators, `itertools` for
-  composition, `AsyncIterator[T]` for async, `Protocol` + dataclass for tree
-  shapes, recursive generators for traversal, `match` for visitor dispatch.
+  composition, `AsyncIterator[T]` for async, closed unions + dataclasses for
+  tree shapes, recursive generators for traversal, exhaustive `match` for
+  visitor dispatch.
   Do NOT use for: type-system idioms (use python-typing-idioms); domain
   primitives (use python-value-objects); aggregates (use python-aggregate-and-repo).
+license: MIT
+compatibility: Python 3.12+.
+metadata:
+  tier: python
 ---
 
 # Stdlib idioms — iteration and tree composition
@@ -17,7 +22,7 @@ description: |
 Two common-but-distinct Python data idioms that don't fit the typing-idioms or value-objects skills, bundled here because each on its own is too thin to be a standalone skill. Use the section that matches your task.
 
 - **Iteration** — generators, `itertools`, lazy pipelines, async iteration
-- **Tree composition** — modeling leaf/composite structures with `Protocol` + dataclass, recursive traversal
+- **Tree composition** — modeling leaf/composite structures with dataclasses and a closed union, recursive traversal
 
 ## When to use this skill
 
@@ -161,9 +166,17 @@ Fine to implement `__iter__` when iteration over the object's contents makes nat
 
 ## Part 2 — Tree composition
 
-When data is recursive (filesystem, AST, query tree, UI hierarchy), the Pythonic shape is `Protocol` interface + dataclass leaves and composites. Same shape as the GoF Composite pattern, less ceremony.
+When data is recursive (filesystem, AST, query tree, UI hierarchy), the Pythonic shape is dataclass leaves and composites, tied together by a type that names every node kind. Same shape as the GoF Composite pattern, less ceremony.
 
-### 1. `Protocol` for the shared interface
+### 1. Name the node kinds with a closed union
+
+```python
+type FileSystemNode = File | Directory
+```
+
+A PEP 695 alias is lazy, so it can be declared before `File` and `Directory` exist and used inside their annotations. Every function that takes a node takes `FileSystemNode`. Because the union lists every kind by name, the type checker knows the full set — which is what makes `match` over it exhaustive (rule 8). No base class, no inheritance.
+
+When the set of node kinds is **open** — plugins or third-party code add their own — use a `Protocol` for the shared methods instead:
 
 ```python
 from typing import Protocol
@@ -173,10 +186,9 @@ class FileSystemNode(Protocol):
     name: str
 
     def size(self) -> int: ...
-    def display(self, indent: int = 0) -> None: ...
 ```
 
-Every leaf and every composite has the same shape from the caller's perspective. `Protocol` types by shape — no inheritance required. A `File` and a `Directory` both satisfy `FileSystemNode` without sharing a base class.
+That trade gives up exhaustive `match`: any class with those methods is a node, so no checker can prove a `match` over it covers every case. With an open set, dispatch through methods on the nodes (rule 3), not through functions that switch on type.
 
 ### 2. Leaves are simple dataclasses
 
@@ -196,7 +208,7 @@ class File:
         print(" " * indent + f"📄 {self.name} ({self.bytes}B)")
 ```
 
-No special "leaf" decoration. Just a class with the methods the Protocol requires.
+No special "leaf" decoration or base class. Just a class with the same methods as its sibling node kinds.
 
 ### 3. Composites hold children and delegate
 
@@ -245,7 +257,7 @@ class Directory:
         return None
 ```
 
-`find_by_name` only makes sense on a directory (a tree root). Don't push it to the Protocol; not every leaf needs it.
+`find_by_name` only makes sense on a directory (a tree root). Don't add it to every node kind; leaves don't need it.
 
 ### 6. Use PEP 695 generics if the tree has typed payloads
 
@@ -279,9 +291,12 @@ class Leaf:
 
 Dataclasses catch the mutable-default case, but the lesson generalizes.
 
-### 8. Visitor pattern: a function with `match` per node type
+### 8. Visitor pattern: a function with an exhaustive `match` over the union
 
 ```python
+from typing import assert_never
+
+
 def to_html(node: FileSystemNode) -> str:
     match node:
         case File(name=name):
@@ -289,13 +304,16 @@ def to_html(node: FileSystemNode) -> str:
         case Directory(name=name, children=children):
             inner = "".join(to_html(c) for c in children)
             return f"<ul><li>{name}{inner}</li></ul>"
+        case _:
+            assert_never(node)
 ```
 
-`match` on dataclasses is the modern visitor: exhaustiveness checking, clean syntax, no `accept(visitor)` ceremony.
+`match` over a closed union is the modern visitor: clean syntax, no `accept(visitor)` ceremony, and exhaustiveness checking. Add `Symlink` to `FileSystemNode` and the type checker flags the `assert_never(node)` line in every visitor that doesn't handle it yet. That check only exists because the union is closed (rule 1) — over a `Protocol`-typed node, `assert_never` can never type-check.
 
 ### When to break tree-composition rules
 
-- **`Protocol` vs `ABC`** — use `ABC` if you need shared method implementations across all node types (rare for trees).
+- **Closed union vs `Protocol`** — union when you own every node kind (exhaustive `match`); `Protocol` when the set is open (behavior as methods on the nodes, no type-switching functions).
+- **`ABC`** — only if node kinds must share method implementations (rare for trees).
 - **Recursive method calls** — for deep trees (10,000+ levels), use an explicit stack/queue, not recursion.
 - **For DAGs (multi-parent), use a visited set** — `walk` with cycle protection. `set[id(node)]` is fine for unhashable nodes.
 
@@ -306,7 +324,7 @@ def to_html(node: FileSystemNode) -> str:
 - **GoF Iterator class** — a class with `__iter__` returning `self` and `__next__` doing the work, when a generator function would have produced the same iterator in three lines.
 - **List comprehensions where generators would do** — `[t for t in totals if t > 1000]` builds a full list before consuming. Use `(t for t in totals if t > 1000)` if you only need to iterate / sum / pass through.
 - **Abstract `Component` class with `add_child` / `remove_child` on every node** — the GoF approach. Leaves don't need those methods; making the interface include them sacrifices type safety for false symmetry.
-- **`isinstance` checks scattered through the codebase** — dispatch with `match` or pull behavior up to the Protocol.
+- **`isinstance` checks scattered through the codebase** — dispatch with an exhaustive `match` over the closed union, or put the behavior on the nodes as methods.
 
 ## See also
 

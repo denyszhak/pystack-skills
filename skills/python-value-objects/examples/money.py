@@ -4,18 +4,15 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Self
 
-
-class NegativeAmountException(ValueError):
-    def __init__(self, amount: Decimal) -> None:
-        super().__init__(f"amount must be >= 0, got {amount}")
+from app.common.exceptions import InvalidInputException
 
 
-class InvalidCurrencyException(ValueError):
+class InvalidCurrencyException(InvalidInputException):
     def __init__(self, currency: str) -> None:
         super().__init__(f"currency must be 3 letters, got {currency!r}")
 
 
-class CurrencyMismatchException(ValueError):
+class CurrencyMismatchException(InvalidInputException):
     def __init__(self, a: str, b: str) -> None:
         super().__init__(f"currencies differ: {a} vs {b}")
 
@@ -26,8 +23,6 @@ class Money:
     currency: str
 
     def __post_init__(self) -> None:
-        if self.amount < 0:
-            raise NegativeAmountException(self.amount)
         if len(self.currency) != 3 or not self.currency.isalpha():
             raise InvalidCurrencyException(self.currency)
         # normalize without mutating self (frozen) by using object.__setattr__
@@ -46,8 +41,19 @@ class Money:
         amount_str, currency = s.rsplit(" ", 1)
         return cls(amount=Decimal(amount_str), currency=currency)
 
+    @classmethod
+    def from_db(cls, amount: Decimal, currency: str) -> Self:
+        return cls(amount=amount, currency=currency)
+
     def to_cents(self) -> int:
         return int(self.amount * 100)
+
+    def __composite_values__(self) -> tuple[Decimal, str]:
+        return self.amount, self.currency
+
+    @property
+    def is_negative(self) -> bool:
+        return self.amount < 0
 
     def __add__(self, other: Money) -> Money:
         self._same_currency(other)
@@ -59,6 +65,9 @@ class Money:
 
     def __mul__(self, factor: Decimal | int) -> Money:
         return Money(amount=self.amount * Decimal(factor), currency=self.currency)
+
+    def __neg__(self) -> Money:
+        return Money(amount=-self.amount, currency=self.currency)
 
     def _same_currency(self, other: Money) -> None:
         if self.currency != other.currency:

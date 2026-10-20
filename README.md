@@ -4,7 +4,7 @@
 
 Opinionated agent skills for typed Python backend services.
 
-PyStack is a repo-owned skill set for AI coding agents such as Claude Code, Codex, OpenCode, and Cursor. It encodes one practical backend shape for a common modern Python service stack so agents, reviewers, and teams know what kind of code to expect.
+PyStack is a repo-owned skill set for AI coding agents such as Claude Code, Codex, Cursor, OpenCode, and GitHub Copilot. It encodes one practical backend shape for a common modern Python service stack so agents, reviewers, and teams know what kind of code to expect.
 
 If your style differs, install the subset that matches yours and skip the rest.
 
@@ -70,70 +70,79 @@ Strategic DDD concepts like context maps and upstream/downstream relationships m
 
 ## Skills
 
-PyStack contains 12 skills across three activation tiers. The `description` field in each skill's frontmatter tells the agent when to load it.
+PyStack contains 12 skills in three tiers. Each tier is also an installable plugin. The `description` field in each skill's frontmatter tells the agent when to load it.
 
-| Tier | Skill | Purpose |
+| Tier / plugin | Skill | Purpose |
 |---|---|---|
-| Broad | `python-typing-idioms` | `Protocol`, `Self`, `NewType`, PEP 695, typed constructors |
-| Broad | `python-value-objects` | Frozen dataclass value objects and ID types |
-| Broad | `python-stdlib-idioms` | Generators, `itertools`, async iteration, tree composition |
-| Broad | `python-antipatterns-cheatsheet` | Singleton and Factory redirects for Python |
-| App | `python-fastapi-sa-app-setup` | App layout, config, lifespan, deps, middleware, exception handlers |
-| App | `python-aggregate-and-repo` | SQLAlchemy model with behavior, aggregate boundaries, repositories |
-| App | `python-service-and-schema-cohesion` | Application services, commands, schemas, transaction ownership |
-| App | `python-external-client` | HTTP clients, retry policy, error mapping, fake transports |
-| App | `python-structlog-logging` | Structlog setup and request correlation |
-| App | `python-test-pyramid` | Real Postgres tests, API tests, external doubles |
-| Opt-in | `python-pure-domain-layer` | Separate pure domain classes when invariants justify mapper cost |
-| Opt-in | `python-message-bus-outbox` | Domain events, in-process bus, outbox, idempotent handlers |
+| `python` | `python-typing-idioms` | `Protocol`, `Self`, `NewType`, PEP 695, typed constructors |
+| `python` | `python-value-objects` | Frozen dataclass value objects and ID types |
+| `python` | `python-stdlib-idioms` | Generators, `itertools`, async iteration, tree composition |
+| `python` | `python-antipatterns-cheatsheet` | Singleton and Factory redirects for Python |
+| `service` | `python-fastapi-sa-app-setup` | App layout, config, lifespan, deps, middleware, exception handlers |
+| `service` | `python-aggregate-and-repo` | SQLAlchemy model with behavior, aggregate boundaries, repositories, value-object mapping |
+| `service` | `python-service-and-schema-cohesion` | Application services, commands, schemas, transaction ownership |
+| `service` | `python-external-client` | HTTP clients, retry policy, error mapping, fake transports |
+| `service` | `python-structlog-logging` | Structlog setup and request correlation |
+| `service` | `python-test-pyramid` | Real Postgres tests, API tests, external doubles |
+| `opt-in` | `python-pure-domain-layer` | Separate pure domain classes when invariants justify mapper cost |
+| `opt-in` | `python-message-bus-outbox` | Domain events, in-process bus, outbox, idempotent handlers |
 
 ## Install
 
-Each tool has its own conventions. Pick yours:
-
-| Tool | Doc |
-|---|---|
-| Claude Code | [install/claude-code.md](install/claude-code.md) |
-| Codex | [install/codex.md](install/codex.md) |
-| OpenCode | [install/opencode.md](install/opencode.md) |
-| Cursor | [install/cursor.md](install/cursor.md) |
-
-Quick start:
+Any agent that reads [Agent Skills](https://agentskills.io/specification) (Claude Code, Codex, Cursor, OpenCode, GitHub Copilot, ...):
 
 ```bash
-git clone https://github.com/denyszhak/pystack-skills
-cd pystack-skills
-
-./install.sh claude-code             # user-level: ~/.claude/skills
-./install.sh claude-code project     # project-level: ./.claude/skills
-./install.sh codex                   # generates ./AGENTS.md
-./install.sh opencode                # copies to ./.opencode/rules/
-./install.sh cursor                  # copies to ./.cursor/rules/
+npx skills add denyszhak/pystack-skills
 ```
+
+Claude Code, as plugins (one per tier):
+
+```text
+/plugin marketplace add denyszhak/pystack-skills
+/plugin install pystack-service@pystack-skills
+```
+
+Or, without Node, symlink from a clone:
+
+```bash
+git clone https://github.com/denyszhak/pystack-skills && cd pystack-skills
+./install.sh claude            # ~/.claude/skills (Claude Code)
+./install.sh agents            # ~/.agents/skills (Codex, Cursor, OpenCode, Copilot, ...)
+```
+
+[INSTALL.md](INSTALL.md) covers where each agent looks, installing a subset, avoiding duplicate skills, and upgrading from the old installer.
 
 ## Skill Format
 
-Each skill is a directory under `skills/` with a `SKILL.md` at its root:
+Each skill is a directory under `skills/` that follows the [Agent Skills specification](https://agentskills.io/specification):
 
 ```text
 skills/python-typing-idioms/
   SKILL.md            # YAML frontmatter + markdown body
-  examples/           # runnable Python examples (optional)
-  reference/          # supplementary docs (optional)
+  examples/           # Python examples the skill points to (optional)
+  references/         # longer supplementary docs, loaded on demand (optional)
 ```
 
-The frontmatter is universal. Every tool either consumes it or ignores it:
+Frontmatter uses only fields from the spec, so every client accepts it:
 
 ```yaml
 ---
-name: python-typing-idioms
-description: |
+name: python-typing-idioms          # matches the directory; lowercase + hyphens, ≤64 chars
+description: |                      # ≤1024 chars: when to use, triggers, what it encodes, when not to
   Use when ... Triggers ... Encodes ...
   Do NOT use for: ...
+license: MIT
+compatibility: Python 3.12+.
+metadata:
+  tier: python                      # python | service | opt-in — read by install.sh
 ---
 ```
 
-Tool-specific fields can be added at install time. See each tool's install doc.
+When you add a skill, add it to the matching plugin's `skills` list in [`.claude-plugin/marketplace.json`](.claude-plugin/marketplace.json) too. Check skills against the spec with the reference validator:
+
+```bash
+uvx --from skills-ref agentskills validate skills/python-typing-idioms
+```
 
 ## Target Stack
 
@@ -141,9 +150,10 @@ PyStack is not a framework, starter template, or claim about all Python. It is v
 
 | Layer | Choice |
 |---|---|
+| Language | Python 3.12+ |
 | HTTP API | FastAPI |
 | Schemas and settings | Pydantic v2 |
-| Persistence | SQLAlchemy 2.0 async |
+| Persistence | SQLAlchemy 2.x async |
 | Database | PostgreSQL |
 | Tests | pytest, real Postgres, protocol-level external doubles |
 | Clients and logging | httpx, structlog |

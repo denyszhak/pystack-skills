@@ -13,6 +13,10 @@ description: |
   outbound publishers.
   Do NOT use for: services with one consumer and no cross-process needs —
   direct function calls are simpler. The skill draws a clear line.
+license: MIT
+compatibility: Python 3.12+ services using FastAPI, SQLAlchemy 2.x (async), and PostgreSQL; a broker client (aiokafka, aio-pika, ...) when publishing or consuming.
+metadata:
+  tier: opt-in
 ---
 
 # Message bus and outbox
@@ -60,9 +64,11 @@ app/
     events.py               # CROSS-PROCESS event wire shapes (Pydantic, for serialization)
   outbox/                   # outbox table model + dispatcher worker
     __init__.py
-    model.py                # OutboxEntry (SA model)
+    model.py                # OutboxEntry (SA model) + event serialization
+    repo.py                 # OutboxRepo: add(event), claim_next()
     dispatcher.py           # background worker that drains the outbox
   handlers/                 # in-process handlers (for the local message bus)
+    __init__.py             # build_message_bus(...) — the one place handlers are wired
     email_on_order_placed.py
     analytics_on_order_placed.py
   common/
@@ -111,42 +117,62 @@ class OrderCancelled:
 
 Past-tense names. Carry just enough data for handlers to act without re-fetching. Frozen because facts don't change.
 
-### 2. Handlers live in `app/handlers/`, one file per concern
+### 2. Handlers live in `app/handlers/`, one factory per file
+
+Each handler module exports a **factory**: it takes the handler's dependencies once, at startup, and returns the handler — an `async def handle(event)` that takes only the event.
 
 ```python
 # app/handlers/email_on_order_placed.py
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
 from app.clients.email import EmailClient
+from app.common.message_bus import Handler
 from app.events.order import OrderPlaced
 from app.repos.customer import CustomerRepo
 
 
-async def email_on_order_placed(
-    event: OrderPlaced,
+def email_on_order_placed(
     *,
-    customers: CustomerRepo,
+    session_factory: async_sessionmaker[AsyncSession],
     emailer: EmailClient,
-) -> None:
-    customer = await customers.get_or_raise(event.customer_id)
-    await emailer.send(
-        to=customer.email,
-        subject="Your order is confirmed",
-        body=f"Total: {event.total} {event.currency}",
-    )
+) -> Handler[OrderPlaced]:
+    async def handle(event: OrderPlaced) -> None:
+        async with session_factory() as session:
+            customer = await CustomerRepo(session).get_or_raise(event.customer_id)
+
+        await emailer.send(
+            to=customer.email,
+            subject="Your order is confirmed",
+            body=f"Total: {event.total} {event.currency}",
+        )
+
+    return handle
 ```
 
 ```python
 # app/handlers/analytics_on_order_placed.py
-async def track_on_order_placed(
-    event: OrderPlaced,
-    *,
-    analytics: AnalyticsClient,
-) -> None:
-    await analytics.track("order.placed", {
-        "order_id": str(event.order_id),
-        "customer_id": str(event.customer_id),
-        "total": float(event.total),
-    })
+from app.clients.analytics import AnalyticsClient
+from app.common.message_bus import Handler
+from app.events.order import OrderPlaced
+
+
+def track_on_order_placed(*, analytics: AnalyticsClient) -> Handler[OrderPlaced]:
+    async def handle(event: OrderPlaced) -> None:
+        await analytics.track("order.placed", {
+            "order_id": str(event.order_id),
+            "customer_id": str(event.customer_id),
+            "total": str(event.total),
+        })
+
+    return handle
 ```
+
+Handlers are **app-lifetime**. They run after the request that produced the event has finished — often in another process, via the outbox — so they never receive the request's `AsyncSession`, repos, or services. The rules that follow:
+
+- **Dependencies are app-lifetime resources only:** `session_factory` (`app.state.db_session_factory`), clients, config. Never a session, repo, or service instance.
+- **One short-lived session per event.** A handler that needs the DB opens `async with session_factory() as session:` inside `handle`, builds the repos it needs from that session, and closes it.
+- **Close the session before slow external I/O.** Load what you need, leave the `async with`, then call the email/HTTP client — don't hold a pooled connection across a network call.
+- **A handler that writes owns its own transaction:** `async with session_factory() as session, session.begin():`.
 
 One handler per file. The file name describes the concern (`email_on_order_placed`, not `handler_1`).
 
@@ -176,44 +202,65 @@ class MessageBus:
 
     async def publish(self, event: object) -> None:
         handlers = self._handlers.get(type(event), [])
-        _log.info("bus.publish", event=type(event).__name__, handlers=len(handlers))
+        # not `event=` — structlog's first positional parameter is already named `event`
+        _log.info("bus.publish", event_type=type(event).__name__, handlers=len(handlers))
+        failures: list[Exception] = []
         for handler in handlers:
             try:
                 await handler(event)
-            except Exception:
-                _log.exception("bus.handler.failed",
-                               event=type(event).__name__,
-                               handler=handler.__name__)
-                # Swallow — handlers must not fail the publishing service.
-                # For at-least-once, use the outbox pattern (rule 5+).
+            except Exception as exc:
+                failures.append(exc)
+        if failures:
+            raise ExceptionGroup(f"{len(failures)} handler(s) failed for {type(event).__name__}", failures)
 ```
 
-In-process. One handler per event type can be registered multiple times. Failures in handlers are logged and swallowed — the publisher's transaction has already committed.
+In-process. An event type can have any number of handlers. Every handler runs even after an earlier one fails; the failures are then raised together as one `ExceptionGroup`.
 
-### 4. Wire handlers at app startup
+**The bus never swallows a failure — its caller decides what a failure means.** The outbox dispatcher (rule 6) catches it and leaves the row for a retry; that is what makes delivery at-least-once. A bus that logs and swallows makes the dispatcher mark every row processed, including the ones whose handlers failed. The only caller that discards failures is a fire-and-forget publish after commit (see "When to break these rules"), and it does so explicitly at the call site.
+
+### 4. Wire handlers in one `build_message_bus` function
 
 ```python
-# app/setup.py — inside provide_app or lifespan
+# app/handlers/__init__.py
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from app.clients.analytics import AnalyticsClient
+from app.clients.email import EmailClient
+from app.clients.warehouse import WarehouseClient
 from app.common.message_bus import MessageBus
 from app.events.order import OrderCancelled, OrderPlaced
-from app.handlers import (
-    email_on_order_placed,
-    track_on_order_placed,
-    notify_warehouse_on_order_cancelled,
-)
+from app.handlers.analytics_on_order_placed import track_on_order_placed
+from app.handlers.email_on_order_placed import email_on_order_placed
+from app.handlers.warehouse_on_order_cancelled import notify_warehouse_on_order_cancelled
 
 
-def _wire_message_bus(app: FastAPI) -> None:
+def build_message_bus(
+    *,
+    session_factory: async_sessionmaker[AsyncSession],
+    emailer: EmailClient,
+    analytics: AnalyticsClient,
+    warehouse: WarehouseClient,
+) -> MessageBus:
     bus = MessageBus()
-    # Handlers need their own deps. They're closures over the app or
-    # take request-scoped deps via a partial — depends on the handler.
-    bus.subscribe(OrderPlaced, lambda e: email_on_order_placed(e, ...))
-    bus.subscribe(OrderPlaced, lambda e: track_on_order_placed(e, ...))
-    bus.subscribe(OrderCancelled, lambda e: notify_warehouse_on_order_cancelled(e, ...))
-    app.state.bus = bus
+    bus.subscribe(OrderPlaced, email_on_order_placed(session_factory=session_factory, emailer=emailer))
+    bus.subscribe(OrderPlaced, track_on_order_placed(analytics=analytics))
+    bus.subscribe(OrderCancelled, notify_warehouse_on_order_cancelled(warehouse=warehouse))
+    return bus
 ```
 
-(Real wiring is finicky because handlers need request-scoped deps. The cleanest pattern: handlers are factory functions that take deps once at registration time and return the actual handler, which then takes only the event.)
+Build the bus in `lifespan`, after the DB pool and clients it needs are initialized:
+
+```python
+# app/setup.py — inside lifespan's AsyncExitStack, after init_db_pool / init_*_client
+app.state.bus = build_message_bus(
+    session_factory=app.state.db_session_factory,
+    emailer=app.state.email_client,
+    analytics=app.state.analytics_client,
+    warehouse=app.state.warehouse_client,
+)
+```
+
+`build_message_bus` is the single wiring point. The API process, the outbox worker process (rule 6), and tests all call it with their own resources — there is no second, hand-rolled wiring anywhere.
 
 ### 5. Outbox for at-least-once delivery — the in-process bus alone isn't reliable
 
@@ -225,35 +272,37 @@ The outbox pattern fixes this:
 2. A separate worker reads the outbox, dispatches events (or publishes to Kafka), and marks rows as processed.
 3. Crash recovery: unprocessed rows get retried on next worker run.
 
+**Before implementing the outbox, read [references/outbox.md](references/outbox.md)** — the complete `app/outbox/model.py`, `repo.py`, and `dispatcher.py`. Copy them as a set. The shapes:
+
 ```python
-# app/models/outbox.py
-from datetime import datetime, UTC
-from uuid import UUID, uuid4
-
-from sqlalchemy.orm import Mapped, mapped_column
-from sqlalchemy.types import JSON
-
-from app.models.base import Base
-
-
+# app/outbox/model.py — shape
 class OutboxEntry(Base):
-    __tablename__ = "outbox"
+    # id, event_type, payload (JSONB), attempts, error,
+    # created_at / available_at / processed_at — all DateTime(timezone=True)
 
-    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
-    event_type: Mapped[str]
-    payload: Mapped[dict] = mapped_column(JSON)
-    created_at: Mapped[datetime] = mapped_column(default=lambda: datetime.now(UTC))
-    processed_at: Mapped[datetime | None] = mapped_column(default=None)
-    error: Mapped[str | None] = mapped_column(default=None)
+    @classmethod
+    def from_event(cls, event: OutboxEvent) -> Self: ...   # TypeAdapter(...).dump_python(event, mode="json")
+    def to_event(self) -> OutboxEvent: ...                   # TypeAdapter(...).validate_python(self.payload)
+    def mark_processed(self) -> None: ...
+    def record_failure(self, exc: Exception) -> None: ...   # attempts += 1, available_at += 2**attempts s
+
+
+# app/outbox/repo.py — shape
+class OutboxRepo:
+    async def add(self, event: OutboxEvent) -> None: ...    # session.add(OutboxEntry.from_event(event))
+    async def claim_next(self) -> OutboxEntry | None: ...   # unprocessed, due, attempts < MAX_ATTEMPTS,
+                                                             # FOR UPDATE SKIP LOCKED, LIMIT 1
 ```
+
+**The payload is JSON, so the event is serialized, not `asdict`-ed.** `asdict(event)` leaves `UUID`, `Decimal`, and `datetime` values in the dict, and the JSON column can't store them. Pydantic's `TypeAdapter` handles stdlib dataclasses: `dump_python(mode="json")` turns those values into strings, and `validate_python` turns them back into the right types. That way `to_event()` returns an event equal to the one that was written. The serialization lives in the outbox module, so the event classes stay plain dataclasses with no Pydantic import.
+
+**Timestamps are `DateTime(timezone=True)`.** `datetime.now(UTC)` is timezone-aware, and asyncpg rejects aware values for a plain `timestamp` column.
+
+The service writes the event through the repo, inside its own transaction:
 
 ```python
 # app/services/checkout.py
-import json
-from dataclasses import asdict
-
 from app.events.order import OrderPlaced
-from app.models.outbox import OutboxEntry
 
 
 class CheckoutService:
@@ -263,156 +312,94 @@ class CheckoutService:
             order.place()
             await self._orders.add(order)
 
-            # Same transaction — outbox + state change are atomic
-            event = OrderPlaced(
+            # Same session, same transaction: the outbox row commits with the
+            # state change, or neither does.
+            await self._outbox.add(OrderPlaced(
                 order_id=order.id,
                 customer_id=order.customer_id,
                 placed_at=order.placed_at,
                 total=order.total,
                 currency=order.currency,
-            )
-            self._session.add(OutboxEntry(
-                event_type="OrderPlaced",
-                payload=asdict(event),
             ))
 
         return OrderGet.from_model(order)
 ```
 
+`self._outbox` is an `OutboxRepo` built from the request session, like every other repo the service uses (`get_outbox_repo` in `app/deps/repos.py`).
+
 ### 6. Outbox worker — separate process, polls the outbox table
 
 ```python
-# app/workers/outbox_dispatcher.py
-import asyncio
-from datetime import UTC, datetime
-
-import structlog
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-
-from app.common.message_bus import MessageBus
-from app.events.order import OrderPlaced, OrderCancelled
-from app.models.outbox import OutboxEntry
-
-
-_log = structlog.get_logger(__name__)
-
-_EVENT_TYPES: dict[str, type] = {
-    "OrderPlaced": OrderPlaced,
-    "OrderCancelled": OrderCancelled,
-}
-
-
-async def dispatch_outbox(session_factory: async_sessionmaker, bus: MessageBus) -> None:
-    async with session_factory() as session:
-        stmt = select(OutboxEntry).where(OutboxEntry.processed_at.is_(None)).limit(100)
-        result = await session.scalars(stmt)
-        entries = list(result)
-
-    for entry in entries:
-        event_cls = _EVENT_TYPES.get(entry.event_type)
-        if event_cls is None:
-            _log.error("outbox.unknown_event_type", type=entry.event_type)
-            continue
-        event = event_cls(**entry.payload)
-        try:
-            await bus.publish(event)
-            async with session_factory() as session:
-                entry.processed_at = datetime.now(UTC)
-                await session.merge(entry)
-                await session.commit()
-        except Exception as exc:
-            _log.exception("outbox.dispatch.failed", entry_id=entry.id)
-            async with session_factory() as session:
-                entry.error = str(exc)
-                await session.merge(entry)
-                await session.commit()
-
-
-async def run_outbox_loop(session_factory: async_sessionmaker, bus: MessageBus) -> None:
-    while True:
-        await dispatch_outbox(session_factory, bus)
-        await asyncio.sleep(1.0)
+# app/outbox/dispatcher.py — core loop; full module (logging, run_outbox_loop) in references/outbox.md
+async def dispatch_outbox(session_factory, bus: MessageBus, *, batch_size: int = 100) -> int:
+    dispatched = 0
+    for _ in range(batch_size):
+        async with session_factory() as session, session.begin():       # one row, one transaction
+            entry = await OutboxRepo(session).claim_next()
+            if entry is None:
+                break
+            try:
+                await bus.publish(entry.to_event())
+            except Exception as exc:                                     # incl. the bus's ExceptionGroup
+                entry.record_failure(exc)
+            else:
+                entry.mark_processed()
+        dispatched += 1
+    return dispatched
 ```
 
-Run as a separate process (`python -m app.workers.outbox_dispatcher`) or as an asyncio task spun up in `lifespan` for single-instance deployments.
+How it stays correct:
+
+- **One row, one transaction, one lock.** `claim_next` uses `SELECT ... FOR UPDATE SKIP LOCKED`, so any number of workers or replicas can run the loop at once: a row locked by one worker is skipped by the others, and no row is delivered twice concurrently. The lock is held while that row's handlers run. The handlers open their own sessions, so each worker uses two pooled connections at a time; size the pool for that.
+- **Success and failure both commit.** On success the row is marked processed. On failure, `record_failure` increments `attempts`, stores the error, and pushes `available_at` back exponentially (2 s, 4 s, 8 s, ... capped at an hour), so a failing row doesn't block or hot-loop the queue.
+- **Dead rows stay for inspection.** After `MAX_ATTEMPTS` a row is no longer claimed. It stays in the table with its `error`, and that is your dead-letter queue. An unknown `event_type` fails through the same path instead of being skipped silently.
+- **A crash re-delivers.** If the worker dies after the handlers ran but before the commit, the lock is released and the row is delivered again. That is at-least-once delivery; rule 8 makes it safe.
+
+Run it as a separate process — a small entrypoint that creates the DB pool and clients, calls `build_message_bus(...)` (rule 4), and awaits `run_outbox_loop` — or as an asyncio task spun up in `lifespan` for single-instance deployments.
 
 ### 7. Consumers subscribe in lifespan; one consumer per topic, dispatching to services
 
 Consumers are inbound entry points — conceptually parallel to FastAPI routes for HTTP. Each consumer subscribes to one topic / queue, parses messages into schemas, dispatches to services, and acks (or rejects, for redelivery).
 
-```python
-# app/consumers/order_consumer.py
-import structlog
-from aiokafka import AIOKafkaConsumer
-
-from app.schemas.events import OrderPlacedEvent
-from app.services.fulfillment import FulfillmentService
-
-
-log = structlog.get_logger(__name__)
-
-
-class OrderConsumer:
-    def __init__(self, *, kafka: AIOKafkaConsumer, fulfillment: FulfillmentService) -> None:
-        self._kafka = kafka
-        self._fulfillment = fulfillment
-
-    async def run(self) -> None:
-        async for message in self._kafka:
-            try:
-                event = OrderPlacedEvent.model_validate_json(message.value)
-                await self._fulfillment.on_order_placed(event)
-            except Exception:
-                log.exception("consumer.failed", topic=message.topic, offset=message.offset)
-                # The consumer group's offset-commit policy decides redelivery.
-                raise
-```
-
-Lifecycle in `lifespan`:
-
-```python
-@asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    config: AppConfig = app.state.config
-    await init_db_pool(app, config.db)
-    await init_openai_client(app, config.openai)
-    await init_kafka_consumer(app, config.kafka)
-
-    consumer_task = asyncio.create_task(app.state.order_consumer.run())
-
-    try:
-        yield
-    finally:
-        consumer_task.cancel()
-        await app.state.order_consumer.close()
-        await close_db_pool(app)
-```
+**Before adding or changing a consumer, read [references/consumers.md](references/consumers.md)** — the full `OrderConsumer` class, its `init_order_consumer` / `cleanup_order_consumer` functions, and the `AsyncExitStack` lifespan that starts and cancels it.
 
 Key rules:
 - **One file per topic / queue.** A file named for what it consumes (`order_consumer.py`, not `consumer_1.py`).
 - **The consumer parses, the service decides.** The consumer does message → schema → `await self._service.method(event)`. No business logic in the consumer.
 - **Schemas (in `app/schemas/events.py`) are the wire contract.** Use Pydantic for parsing untrusted inbound JSON. Validate early; if it fails to parse, the consumer's error policy (dead letter? skip? halt?) decides what to do.
-- **Background task in `lifespan`.** Started with `asyncio.create_task(consumer.run())`. Cancelled cleanly at shutdown.
+- **Background task in `lifespan`.** Started with `asyncio.create_task(consumer.run())` and registered on the same `AsyncExitStack`, so it is cancelled before the resources it uses are closed.
+- **One session per message.** Same rule as handlers (rule 2): the consumer holds `session_factory`, never a session or a service built from one.
 - **For multi-replica deployments**, use the broker's consumer group semantics (Kafka consumer groups, RabbitMQ queue sharding) — the broker handles work distribution. Don't try to coordinate in-app.
 
 ### 8. Handlers must be idempotent
 
-The outbox guarantees *at least once* delivery. Handlers may receive the same event twice (worker crashes after dispatch, before marking processed). Make them safe to call twice with the same input.
+The outbox guarantees *at least once* delivery. Handlers may receive the same event twice: the worker can crash after dispatch but before marking the row processed. A failed row is also retried as a whole, so when one handler fails, every handler on that event runs again, including the ones that already succeeded. Make them safe to call twice with the same input.
 
 Common patterns:
 - Idempotency key derived from event (`event.order_id` as the natural key for "this order was processed")
 - Check-then-act guarded by unique constraint or upsert
 
 ```python
-async def email_on_order_placed(event: OrderPlaced, *, emailer, customers, repo):
-    # Skip if we've already sent this email
-    sent = await repo.was_sent(event.order_id)
-    if sent:
-        return
-    await emailer.send(...)
-    await repo.mark_sent(event.order_id)
+def email_on_order_placed(
+    *,
+    session_factory: async_sessionmaker[AsyncSession],
+    emailer: EmailClient,
+) -> Handler[OrderPlaced]:
+    async def handle(event: OrderPlaced) -> None:
+        async with session_factory() as session:
+            if await NotificationRepo(session).was_sent(order_id=event.order_id, kind="order_confirmation"):
+                return                                   # already handled this event
+            customer = await CustomerRepo(session).get_or_raise(event.customer_id)
+
+        await emailer.send(to=customer.email, ...)
+
+        async with session_factory() as session, session.begin():
+            await NotificationRepo(session).mark_sent(order_id=event.order_id, kind="order_confirmation")
+
+    return handle
 ```
+
+A crash between `send` and `mark_sent` still sends twice — the sending side can't fully close that window. If the provider accepts an idempotency key, pass one derived from the event (`f"order-confirmation-{event.order_id}"`).
 
 ### 9. Don't put business logic in handlers
 
@@ -437,33 +424,27 @@ If the cancelling service needs to decide "should we refund?", that decision hap
 
 Events are facts. Don't model "the customer's lifetime spending" as "consume all `OrderPlaced` events from the beginning of time." That's event sourcing, a different (much bigger) commitment. For aggregations, query the relational state directly.
 
-### 11. Test handlers in isolation, then integration-test the bus
+### 11. Test with real collaborators — no mocks
 
-```python
-# tests/unit/handlers/test_email_on_order_placed.py
-async def test_handler_sends_email(emailer_mock, customer_repo_mock):
-    event = OrderPlaced(order_id=uuid4(), customer_id=customer.id, ...)
-    customer_repo_mock.get_or_raise.return_value = customer
+Same rules as `python-test-pyramid`: real Postgres, `httpx.MockTransport` doubles for HTTP clients, and plain recording functions where a handler is needed. No `Mock`, `AsyncMock`, `patch`, or `mocker`.
 
-    await email_on_order_placed(event, customers=customer_repo_mock, emailer=emailer_mock)
+- **The bus** — unit tests with no DB. Subscribe a recording `async def record(event)` function, publish, and assert on what it recorded. Add a failing handler too: the other handlers must still run, and `publish` must raise an `ExceptionGroup`.
+- **A handler** — through its factory. Pass `app.state.db_session_factory` and the real client built on its `MockTransport` double, seed the DB with real rows, call `handle(event)`, and assert on what the double recorded.
+- **The dispatcher** — insert real rows with `OutboxEntry.from_event(...)` and run `dispatch_outbox`. On success, this test's row has `processed_at` set and the handler received an event equal to the original. On failure, the row is not processed, `attempts` is 1, and `available_at` has moved into the future.
 
-    emailer_mock.send.assert_called_once_with(to=customer.email, ...)
-
-
-# tests/integration/test_outbox.py
-async def test_outbox_dispatches_committed_events(session, bus):
-    session.add(OutboxEntry(event_type="OrderPlaced", payload={...}))
-    await session.commit()
-
-    await dispatch_outbox(session_factory, bus)
-
-    # Verify handler ran, entry marked processed
-```
+**Before writing these tests, read [references/testing.md](references/testing.md)** for worked examples of all three.
 
 ## When to break these rules
 
 - **Direct function calls instead of events** — for in-process side effects with one consumer, just call the function. The bus is overhead.
-- **In-process bus only, no outbox** — fine for fire-and-forget side effects where loss is acceptable (e.g. cache warming). For anything user-visible, use the outbox.
+- **In-process bus only, no outbox** — fine for fire-and-forget side effects where loss is acceptable (e.g. cache warming). For anything user-visible, use the outbox. Publish after the transaction commits, and discard failures explicitly at the call site, because the use case has already succeeded:
+
+  ```python
+  try:
+      await self._bus.publish(event)
+  except* Exception:
+      _log.exception("bus.publish.failed", event_type=type(event).__name__)
+  ```
 - **Synchronous handlers** — possible but the asyncio version is canonical; mixing sync and async handlers complicates the bus.
 
 ## Anti-patterns this displaces

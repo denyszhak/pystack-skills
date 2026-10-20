@@ -11,6 +11,10 @@ description: |
   one repo per aggregate root, named query methods over generic filter objects.
   Do NOT use for: projects that have an explicit `domain/` directory with pure
   domain classes — use `python-pure-domain-layer` instead.
+license: MIT
+compatibility: Python 3.12+ services using FastAPI, Pydantic v2, SQLAlchemy 2.x (async), and PostgreSQL.
+metadata:
+  tier: service
 ---
 
 # Aggregate and repository pattern
@@ -97,28 +101,32 @@ A repo with 12 methods nobody uses is dead code. The skill of restraint is more 
 
 When in doubt: don't add it. Add it when a service demands it.
 
-### 5. `add` vs `save` — be explicit about which case the service is in
+### 5. `add` for new aggregates; a loaded aggregate is already tracked
 
 ```python
 async def add(self, order: Order) -> None:
-    """Insert a new aggregate. Fast: no SELECT, just INSERT."""
     self._session.add(order)
+    try:
+        await self._session.flush()                 # INSERT now, so violations surface here
+    except IntegrityError as exc:
+        raise UniqueViolationException(...) from exc
+```
+
+The service knows which case it's in:
+
+- **Just called `Order.new(...)`?** Call `repo.add(order)`.
+- **Just called `repo.get_or_raise(...)`?** Mutate the aggregate and call nothing else. It is attached to the session (identity map), so the commit at the end of the service's `async with session.begin()` block writes its changes.
+
+**Never write `save()` as `session.merge(order)`.** On an attached aggregate, `merge` does nothing. On a detached one, it copies the state onto a *different* instance and returns that copy; code that ignores the return value keeps mutating the original, and those later changes are never saved. If a use case needs an update's constraint violations to surface at a specific line rather than at commit, add a `save` that flushes:
+
+```python
+async def save(self, order: Order) -> None:
+    # `order` came from this repo's session, so it's already tracked — flush writes it now.
     try:
         await self._session.flush()
     except IntegrityError as exc:
         raise UniqueViolationException(...) from exc
-
-
-async def save(self, order: Order) -> None:
-    """Persist changes to an existing aggregate loaded earlier. Uses MERGE."""
-    await self._session.merge(order)
 ```
-
-The service knows which one applies:
-- Just called `Order.new(...)`? → `repo.add(order)`
-- Just called `repo.get_or_raise(...)`? → `repo.save(order)` (or skip the call entirely — SA's identity map auto-flushes changes to attached objects on commit; the explicit `save` makes the persistence boundary visible)
-
-If you find yourself only ever using one of `add` / `save`, drop the other.
 
 ### 6. `get_or_raise` for the common "load or fail the use case" path
 
@@ -181,7 +189,7 @@ Without an explicit loading strategy you'll hit `MissingGreenlet` on attribute a
 
 ### 10. `expire_on_commit=False` on the sessionmaker is mandatory
 
-This isn't strictly aggregate code, but it has to be set in `app/db/__init__.py` or `repo.save` / `schema.from_model` will fail:
+This isn't strictly aggregate code, but it has to be set in `app/db/__init__.py`, or `schema.from_model` fails after the transaction commits:
 
 ```python
 app.state.db_session_factory = async_sessionmaker(pool, expire_on_commit=False)
@@ -189,11 +197,76 @@ app.state.db_session_factory = async_sessionmaker(pool, expire_on_commit=False)
 
 After `session.commit()`, SA by default *expires* every attached object so the next attribute access triggers a re-fetch. In async, that re-fetch is a coroutine — and accessing it from a non-async context (like a Pydantic field) raises `MissingGreenlet`. Setting `expire_on_commit=False` keeps the attributes loaded.
 
+### 11. Value objects on the model: `composite()` for multi-column, `TypeDecorator` for single-column
+
+Value objects (`python-value-objects`) are frozen `kw_only` dataclasses that live *on* the model, not beside it as loose columns. Two mappings cover them.
+
+**Multi-column (`Money`) → `composite()`.** SQLAlchemy builds a composite positionally — `Money(amount, currency)` — which a `kw_only` dataclass rejects (`TypeError: Money.__init__() takes 1 positional argument but 3 were given`). Give the value object a positional constructor and `__composite_values__`, and hand the constructor to `composite()`:
+
+```python
+# app/common/value_objects.py
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Money:
+    amount: Decimal
+    currency: str
+
+    @classmethod
+    def from_db(cls, amount: Decimal, currency: str) -> Self:
+        return cls(amount=amount, currency=currency)
+
+    def __composite_values__(self) -> tuple[Decimal, str]:
+        return self.amount, self.currency
+```
+
+```python
+# app/models/order.py
+class OrderLine(Base):
+    __tablename__ = "order_line"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    order_id: Mapped[UUID] = mapped_column(ForeignKey("order.id"))
+    quantity: Mapped[int]
+    unit_price: Mapped[Money] = composite(
+        Money.from_db,
+        mapped_column("unit_price_amount", Numeric(12, 2)),
+        mapped_column("unit_price_currency", String(3)),
+    )
+```
+
+`line.unit_price` is a `Money`; assigning a new `Money` writes both columns; `OrderLine.unit_price == Money(...)` works in `select()`. Neither method imports SQLAlchemy, so the value object stays a plain dataclass.
+
+**Single-column (`EmailAddress`) → `TypeDecorator`, registered once on `Base`:**
+
+```python
+# app/models/types.py
+class EmailAddressType(TypeDecorator[EmailAddress]):
+    impl = String(320)
+    cache_ok = True
+
+    def process_bind_param(self, value: EmailAddress | None, dialect: Dialect) -> str | None:
+        return value.value if value is not None else None
+
+    def process_result_value(self, value: str | None, dialect: Dialect) -> EmailAddress | None:
+        return EmailAddress(value=value) if value is not None else None
+
+
+# app/models/base.py
+class Base(DeclarativeBase):
+    type_annotation_map = {EmailAddress: EmailAddressType}
+
+
+# app/models/customer.py
+class Customer(Base):
+    email: Mapped[EmailAddress] = mapped_column(unique=True)
+```
+
+Rules hang off the holder, not the value: `Money` is signed, so "a unit price can't be negative" is a precondition in `Order.add_line`, not a check inside `Money`.
+
 ## When to break these rules
 
 - **Behavior on SA model** — if a method does no I/O but is complex enough to want sub-millisecond unit tests without a DB, factor the pure logic into a domain service/policy that the model or application service calls. Or switch to `python-pure-domain-layer`.
 - **`get_or_raise`** — drop it if every caller wants `None` semantics. Add it when 2+ services duplicate the "raise if missing" pattern.
-- **`add` vs `save` split** — fine to use just `save` if your app has no perf-sensitive insert path. Choose the API your services actually use.
+- **`save`** — optional. Add the flushing `save` only when a use case needs an update's constraint violations to surface before commit; otherwise the commit at the end of `begin()` is the save.
 - **`relationship(lazy="selectin")`** — for relationships you never access via the parent, use `lazy="raise"` to force explicit loading and catch bugs early.
 
 ## Anti-patterns this displaces
@@ -217,13 +290,16 @@ class BaseRepo[T: Base]:
 
     async def add(self, item: T) -> None:
         self._session.add(item)
+        await self._flush()
+
+    async def save(self, item: T) -> None:      # `item` is already tracked; write it now (rule 5)
+        await self._flush()
+
+    async def _flush(self) -> None:
         try:
             await self._session.flush()
         except IntegrityError as exc:
             raise UniqueViolationException(...) from exc
-
-    async def save(self, item: T) -> None:
-        await self._session.merge(item)
 
 
 class OrderRepo(BaseRepo[Order]):

@@ -3,93 +3,170 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILLS_DIR="$REPO_DIR/skills"
+TIERS="python service opt-in"
 
 usage() {
-  cat <<EOF
-Install PyStack into your AI coding tool.
+  cat <<'EOF'
+Install PyStack skills by linking each one into an agent's skills directory.
 
 Usage:
-  install.sh claude-code [user|project]    Symlink skills into ~/.claude/skills (user, default)
-                                            or ./.claude/skills (project).
-  install.sh codex [output-file]            Generate AGENTS.md at ./AGENTS.md (default) or
-                                            the path you pass.
-  install.sh opencode                       Copy skills into ./.opencode/rules/
-  install.sh cursor                         Copy skills into ./.cursor/rules/ as .mdc files
+  install.sh <target> [options] [tier|skill ...]
+  install.sh --list
 
-Re-run after 'git pull' in this repo to update.
+Targets:
+  claude    Claude Code                         ~/.claude/skills  (--project: ./.claude/skills)
+  agents    Codex, Cursor, OpenCode, GitHub     ~/.agents/skills  (--project: ./.agents/skills)
+            Copilot / VS Code, Gemini CLI, and
+            other Agent Skills clients
+
+Selection (default: every skill):
+  python | service | opt-in    every skill in that tier
+  python-<name>                one skill by name
+
+Options:
+  --project     install into the current directory instead of your home directory
+  --copy        copy instead of symlink (symlinks pick up `git pull`; copies don't)
+  --force       replace an existing non-symlink directory with the same skill name
+  --uninstall   remove the selected skills from the target instead
+  --list        list skills and their tiers
+  -h, --help    show this help
+
+Examples:
+  install.sh claude                           # every skill, for you, in Claude Code
+  install.sh agents --project service         # service tier into ./.agents/skills
+  install.sh claude python python-test-pyramid
 EOF
 }
 
-claude_code() {
-  local scope="${1:-user}"
-  case "$scope" in
-    user)
-      local target="$HOME/.claude/skills"
-      mkdir -p "$(dirname "$target")"
-      if [ -e "$target" ] && [ ! -L "$target" ]; then
-        echo "error: $target exists and is not a symlink. Move it aside and retry." >&2
-        exit 1
-      fi
-      ln -sfn "$SKILLS_DIR" "$target"
-      echo "linked $SKILLS_DIR -> $target"
-      ;;
-    project)
-      local target=".claude/skills"
-      mkdir -p .claude
-      ln -sfn "$SKILLS_DIR" "$target"
-      echo "linked $SKILLS_DIR -> $(pwd)/$target"
-      ;;
-    *)
-      echo "error: unknown scope '$scope' (expected: user | project)" >&2
-      exit 1
-      ;;
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+all_skills() {
+  for dir in "$SKILLS_DIR"/*/; do
+    [ -f "$dir/SKILL.md" ] && basename "$dir"
+  done
+}
+
+tier_of() {
+  awk '/^---$/ { fences++; next } fences == 1 && /^  tier:/ { print $2; exit }' "$SKILLS_DIR/$1/SKILL.md"
+}
+
+list_skills() {
+  for name in $(all_skills); do
+    printf '%-8s %s\n' "$(tier_of "$name")" "$name"
+  done
+}
+
+TOOL=""
+PROJECT=0
+COPY=0
+FORCE=0
+UNINSTALL=0
+WANTED=""
+
+[ $# -gt 0 ] || { usage >&2; exit 1; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    claude|claude-code) TOOL="claude" ;;
+    agents|codex|cursor|opencode|copilot) TOOL="agents" ;;
+    --project) PROJECT=1 ;;
+    --copy) COPY=1 ;;
+    --force) FORCE=1 ;;
+    --uninstall) UNINSTALL=1 ;;
+    --list) list_skills; exit 0 ;;
+    -h|--help) usage; exit 0 ;;
+    -*) die "unknown option: $1" ;;
+    *) WANTED="$WANTED $1" ;;
+  esac
+  shift
+done
+
+[ -n "$TOOL" ] || die "missing target: claude or agents (see --help)"
+
+SELECTED=" "
+select_skill() {
+  case "$SELECTED" in
+    *" $1 "*) ;;
+    *) SELECTED="$SELECTED$1 " ;;
   esac
 }
 
-codex() {
-  local out="${1:-AGENTS.md}"
-  {
-    echo "# PyStack conventions"
-    echo
-    echo "These conventions apply to all Python code in this repo."
-    echo
-    for f in "$SKILLS_DIR"/*/SKILL.md; do
-      local name
-      name="$(basename "$(dirname "$f")")"
-      echo "## $name"
-      awk '/^---$/{c++; next} c>=2' "$f"
-      echo
-    done
-  } > "$out"
-  echo "wrote $out"
-}
+if [ -z "$WANTED" ]; then
+  for name in $(all_skills); do select_skill "$name"; done
+fi
+for item in $WANTED; do
+  case " $TIERS " in
+    *" $item "*)
+      for name in $(all_skills); do
+        [ "$(tier_of "$name")" = "$item" ] && select_skill "$name"
+      done
+      continue
+      ;;
+  esac
+  if [ -f "$SKILLS_DIR/$item/SKILL.md" ]; then
+    select_skill "$item"
+  elif [ "$item" = "project" ] || [ "$item" = "user" ]; then
+    die "unknown skill or tier: $item (did you mean --project?)"
+  else
+    die "unknown skill or tier: $item (tiers: $TIERS; see --list)"
+  fi
+done
 
-opencode() {
-  mkdir -p .opencode/rules
-  for d in "$SKILLS_DIR"/*/; do
-    local name
-    name="$(basename "$d")"
-    cp "$d/SKILL.md" ".opencode/rules/$name.md"
-  done
-  echo "copied skills to $(pwd)/.opencode/rules/"
-}
-
-cursor() {
-  mkdir -p .cursor/rules
-  for d in "$SKILLS_DIR"/*/; do
-    local name
-    name="$(basename "$d")"
-    cp "$d/SKILL.md" ".cursor/rules/${name}.mdc"
-  done
-  echo "copied skills to $(pwd)/.cursor/rules/"
-  echo "note: Cursor supports 'globs' and 'alwaysApply' frontmatter — see install/cursor.md"
-}
-
-case "${1:-}" in
-  claude-code) shift; claude_code "$@";;
-  codex)       shift; codex "$@";;
-  opencode)    shift; opencode "$@";;
-  cursor)      shift; cursor "$@";;
-  -h|--help|"") usage;;
-  *) echo "error: unknown tool '$1'" >&2; usage; exit 1;;
+if [ "$PROJECT" = 1 ]; then BASE="$PWD"; else BASE="$HOME"; fi
+case "$TOOL" in
+  claude) DEST="$BASE/.claude/skills" ;;
+  agents) DEST="$BASE/.agents/skills" ;;
 esac
+
+if [ -L "$DEST" ]; then
+  die "$DEST is itself a symlink (to $(readlink "$DEST")), probably from an older PyStack installer that linked the whole directory.
+       Remove the link (this deletes no skills) and re-run: rm \"$DEST\""
+fi
+
+SKIPPED=0
+skip() {
+  echo "skip    $1: $2" >&2
+  SKIPPED=$((SKIPPED + 1))
+}
+
+install_skill() {
+  local name="$1" dest="$DEST/$1"
+  if [ -L "$dest" ]; then
+    rm "$dest"
+  elif [ -e "$dest" ]; then
+    [ "$FORCE" = 1 ] || { skip "$name" "$dest exists and is not a symlink (--force replaces it)"; return 0; }
+    rm -rf "$dest"
+  fi
+  if [ "$COPY" = 1 ]; then
+    cp -R "$SKILLS_DIR/$name" "$dest"
+  else
+    ln -s "$SKILLS_DIR/$name" "$dest"
+  fi
+  echo "added   $name"
+}
+
+uninstall_skill() {
+  local name="$1" dest="$DEST/$1"
+  if [ -L "$dest" ]; then
+    rm "$dest"
+  elif [ -e "$dest" ]; then
+    [ "$FORCE" = 1 ] || { skip "$name" "$dest is a copy, not a symlink (--force deletes it)"; return 0; }
+    rm -rf "$dest"
+  else
+    return 0
+  fi
+  echo "removed $name"
+}
+
+if [ "$UNINSTALL" = 1 ]; then
+  for name in $SELECTED; do uninstall_skill "$name"; done
+else
+  mkdir -p "$DEST"
+  for name in $SELECTED; do install_skill "$name"; done
+fi
+
+echo "target: $DEST"
+[ "$SKIPPED" = 0 ] || exit 1

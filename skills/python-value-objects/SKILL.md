@@ -11,6 +11,10 @@ description: |
   Do NOT use for: aggregate roots (mutable, identity-based — see
   python-aggregate-and-repo); Pydantic models for HTTP I/O (see
   python-service-and-schema-cohesion).
+license: MIT
+compatibility: Python 3.12+.
+metadata:
+  tier: python
 ---
 
 # Python value objects
@@ -62,23 +66,36 @@ These three flags together are the canonical value object shape. Make them the d
 ### 2. Invariants in `__post_init__`, raising typed exceptions
 
 ```python
+from app.common.exceptions import InvalidInputException
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Money:
     amount: Decimal
     currency: str
 
     def __post_init__(self) -> None:
-        if self.amount < 0:
-            raise NegativeAmountException(self.amount)
-        if len(self.currency) != 3:
+        if len(self.currency) != 3 or not self.currency.isalpha():
             raise InvalidCurrencyException(self.currency)
 
 
-class NegativeAmountException(ValueError): ...
-class InvalidCurrencyException(ValueError): ...
+class InvalidCurrencyException(InvalidInputException): ...
 ```
 
-Invariants belong with the data. If `Money` can never be negative, `Money(-1, "USD")` should fail at construction — not "be flagged elsewhere." Exception types are domain words, raised at the moment the data is wrong.
+Invariants belong with the data. A three-letter currency is true of *every* `Money`, so `Money(amount=..., currency="dollars")` fails at construction — not "gets flagged elsewhere." Exception types are domain words, raised at the moment the data is wrong.
+
+Only put an invariant on the value object if it holds for every use of it. `Money` is **signed**: refunds, credits, and balances go below zero, and `a - b` has to be able to. "Must not be negative" is a rule of the thing *holding* the money — a unit price, a payment amount — so it's checked there:
+
+```python
+def add_line(self, *, product_id: UUID, quantity: int, unit_price: Money) -> None:
+    if unit_price.is_negative:
+        raise NegativeUnitPriceException(unit_price)
+    ...
+```
+
+**Exception base.** In a PyStack service, value-object exceptions inherit from `InvalidInputException` (`app/common/exceptions.py`), so the global handler maps them to 400 like every other domain error — a bare `ValueError` falls through to a 500. In a standalone library with no app exception hierarchy, `ValueError` is the right base.
+
+**Location.** Value objects shared across aggregates (`Money`, `EmailAddress`) live in `app/common/value_objects.py`. One used by a single aggregate lives in that aggregate's model file.
 
 ### 3. Behavior as methods on the class
 
@@ -102,6 +119,13 @@ class Money:
 
     def __mul__(self, factor: Decimal | int) -> "Money":
         return Money(amount=self.amount * Decimal(factor), currency=self.currency)
+
+    def __neg__(self) -> "Money":
+        return Money(amount=-self.amount, currency=self.currency)
+
+    @property
+    def is_negative(self) -> bool:
+        return self.amount < 0
 
     @classmethod
     def zero(cls, currency: str) -> "Money":
@@ -154,7 +178,13 @@ CustomerId = NewType("CustomerId", UUID)
 
 Use a full value object class when there's behavior, validation, or multiple fields. Use `NewType` when it's a single typed wrapper around a primitive.
 
-### 7. Don't reach for Pydantic for value objects
+SQLAlchemy can't map a `NewType` column on its own — see `python-typing-idioms` rule 3 for where PyStack uses `NewType` IDs and how to register them on `Base` if you want them on models too.
+
+### 7. Persisting value objects on SA models
+
+In the default style, value objects live *on* SA models: `composite()` for multi-column values like `Money`, a `TypeDecorator` for single-column ones like `EmailAddress`. The mapping code lives in `python-aggregate-and-repo` (rule 11); the value object stays free of SQLAlchemy imports.
+
+### 8. Don't reach for Pydantic for value objects
 
 Pydantic is great for I/O (parsing untrusted JSON, schema validation for HTTP). It's overkill for internal domain primitives: it carries serialization machinery, alias config, `model_validate` calls — none of which a `Money` needs.
 
@@ -173,7 +203,7 @@ class Money:
     currency: str
 ```
 
-A `MoneyDto.from_money` / `money.to_dto()` pair at the boundary keeps the domain pure.
+Put both translations on the DTO — `MoneyDto.from_money(money)` inbound, `dto.to_money()` outbound — so the value object never imports Pydantic.
 
 ## When to break these rules
 

@@ -21,7 +21,7 @@ class OrderStatus(StrEnum):
 
 
 class DomainException(Exception): ...
-class NegativeAmountException(DomainException): ...
+class NegativeUnitPriceException(DomainException): ...
 class InvalidCurrencyException(DomainException): ...
 class CurrencyMismatchException(DomainException): ...
 class OrderAlreadyPlacedException(DomainException): ...
@@ -35,8 +35,6 @@ class Money:
     currency: str
 
     def __post_init__(self) -> None:
-        if self.amount < 0:
-            raise NegativeAmountException(f"amount must be >= 0, got {self.amount}")
         if len(self.currency) != 3 or not self.currency.isalpha():
             raise InvalidCurrencyException(f"currency must be 3 letters, got {self.currency!r}")
 
@@ -51,6 +49,10 @@ class OrderLine:
     product_id: ProductId
     quantity: int
     unit_price: Money
+
+    def __post_init__(self) -> None:
+        if self.unit_price.amount < 0:
+            raise NegativeUnitPriceException(f"unit price must be >= 0, got {self.unit_price.amount}")
 
     @property
     def subtotal(self) -> Money:

@@ -10,11 +10,15 @@ description: |
   constructors via `@classmethod from_X(cls, ...) -> Self`, avoiding `Any`,
   narrowing patterns.
   Do NOT use for: untyped Python codebases that aren't ready to adopt type hints.
+license: MIT
+compatibility: Python 3.12+ (TypeIs from typing_extensions until 3.13).
+metadata:
+  tier: python
 ---
 
 # Python typing idioms
 
-Modern typed Python is a different language than typed Python five years ago. PEP 695 (Python 3.12) made generics and type aliases first-class. `Protocol` finally displaced `ABC` for most interface use cases. The `Self` type lets `@classmethod` constructors and builder-style methods type themselves correctly.
+Modern typed Python is a different language than typed Python five years ago. PEP 695 (Python 3.12) made generics and type aliases first-class — which is why PyStack's baseline is **Python 3.12+**. `Protocol` finally displaced `ABC` for most interface use cases. The `Self` type lets `@classmethod` constructors and builder-style methods type themselves correctly.
 
 This skill encodes the idioms that hold up in 2026 typed Python.
 
@@ -104,7 +108,22 @@ customer_id = CustomerId(uuid4())
 get_order(customer_id)   # ty/mypy: error — CustomerId is not OrderId
 ```
 
-Use `NewType` for every primary key and every identifier the user can hold. Cheap; pays for itself the first time you would have shipped a swap.
+Cheap at runtime; pays for itself the first time you would have shipped a swap.
+
+**Where PyStack uses it.** `NewType` IDs are the default in framework-free code: the pure domain layer (`python-pure-domain-layer`), value objects, and anything else that doesn't touch SQLAlchemy. In the default SA-model style (`python-aggregate-and-repo`), models, repos, and services use plain `Mapped[UUID]` / `UUID` — SQLAlchemy can't map a `NewType` on its own:
+
+```python
+class Order(Base):
+    id: Mapped[OrderId] = mapped_column(primary_key=True, default=uuid4)
+    # MappedAnnotationError: Could not locate SQLAlchemy Core type ... 'OrderId'
+```
+
+If you want typed IDs in the SA-model style too, register each one on `Base` and adopt it project-wide (models, repos, services, commands) — a half-converted codebase is worse than either choice:
+
+```python
+class Base(DeclarativeBase):
+    type_annotation_map = {OrderId: Uuid(), CustomerId: Uuid(), ProductId: Uuid()}
+```
 
 ### 4. PEP 695 type aliases over `TypeAlias` and `Union`
 
@@ -240,16 +259,10 @@ def render(event: OrderEvent) -> str:
             return f"refunded {a}"
 ```
 
-For custom predicates, prefer `TypeIs` (PEP 742, Python 3.13+) over `TypeGuard` — `TypeIs` narrows in both branches, `TypeGuard` only in the `True` branch.
+For custom predicates, prefer `TypeIs` (PEP 742) over `TypeGuard` — `TypeIs` narrows in both branches, `TypeGuard` only in the `True` branch. `TypeIs` is in `typing` from Python 3.13; on PyStack's 3.12 baseline import it from `typing_extensions`.
 
 ```python
-from typing import TypeIs
-
-def is_uuid(s: str) -> TypeIs[str]:        # placeholder; real example below
-    ...
-
-# More realistic — narrowing a heterogeneous list
-from typing import TypeIs
+from typing_extensions import TypeIs        # `from typing import TypeIs` on 3.13+
 
 def is_str(x: object) -> TypeIs[str]:
     return isinstance(x, str)
@@ -286,12 +299,12 @@ For larger sets or sets with behavior, use `StrEnum`.
 
 - **`Protocol`/`ABC`** — if you need to enforce interface usage at construction time (raise on instantiation of an abstract class), `ABC` does that; `Protocol` doesn't.
 - **`Self`** — methods that always return a fixed concrete class (not the subclass) should name the class explicitly.
-- **`NewType`** — primary keys and identifiers, yes; not every `int` is worth wrapping. Reserve for things you can confuse.
+- **`NewType`** — identifiers you can confuse, yes; not every `int` is worth wrapping. In the SA-model style, only with `type_annotation_map` and only project-wide (rule 3).
 - **`Any`** — at the JSON parsing boundary, before Pydantic validation. Once parsed, never again.
 - **`TypeIs`/`TypeGuard`** — only needed when `isinstance` and `match` can't express the predicate. Don't reach for them by default.
 
 ## See also
 
 - `python-value-objects` — uses `NewType`, `Self`, frozen dataclasses
-- `python-stdlib-idioms` — uses `Iterable[T]`, `AsyncIterator[T]` from `collections.abc`; tree composition with Protocol + dataclass
+- `python-stdlib-idioms` — uses `Iterable[T]`, `AsyncIterator[T]` from `collections.abc`; tree composition with closed unions + dataclasses
 - `python-antipatterns-cheatsheet` — Factory Method redirect (use `@classmethod` returning `Self`)

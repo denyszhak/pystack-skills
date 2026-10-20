@@ -2,20 +2,22 @@
 name: python-service-and-schema-cohesion
 description: |
   Use when designing or editing services and schemas in a FastAPI + SQLAlchemy
-  backend: files in `app/services/` and `app/schemas/`. Triggers on edits to
-  those directories; on definitions of `class *Service`, `class *Command`,
-  `class *Get`; on user mentions of "use case", "service layer", "Pydantic
-  schema", "command", "response shape", "from_model", "to_new_X", "cohesion",
-  "domain service", "policy", "god service", "business rule extraction".
-  Encodes: class-when-state vs function-when-stateless, service returns Pydantic
-  schema (not SA model), top-level service owns the transaction with
-  `AsyncSession.begin()`, composable collaborators do not commit, pure domain
-  services/policies for business rules that do not belong to one aggregate,
-  schema naming (*Get / *Create / *Update / *Command), cohesion methods
-  (`from_<source>` classmethod inbound, `to_<target>` method outbound), Pydantic v2
-  `from_attributes=True`, no `utils.py` / no free transform functions.
+  backend: files in `app/services/` and `app/schemas/`; definitions of
+  `class *Service`, `*Command`, `*Get`; mentions of "use case", "service layer",
+  "Pydantic schema", "command", "from_model", "cohesion", "domain service",
+  "policy", "god service". Encodes: class-when-state vs function-when-stateless,
+  services return Pydantic schemas (not SA models), the top-level service owns
+  the transaction with `AsyncSession.begin()` opened before any session access,
+  composable collaborators don't commit, pure domain services/policies for rules
+  that span aggregates, schema naming (*Get / *Create / *Update / *Command),
+  cohesion methods (`from_<source>` inbound, `to_<target>` outbound), no
+  `utils.py` / free transform functions.
   Do NOT use for: repos (use python-aggregate-and-repo), routes (use
   python-fastapi-sa-app-setup).
+license: MIT
+compatibility: Python 3.12+ services using FastAPI, Pydantic v2, SQLAlchemy 2.x (async), and PostgreSQL.
+metadata:
+  tier: service
 ---
 
 # Service layer and schema cohesion
@@ -106,6 +108,37 @@ Rules:
 - No `commit()` / `begin()` in routes. Routes call one service method and return its schema.
 - One top-level use case = one transaction owner. That owner is the outer service command method.
 - All repos participating in a use case must be built from the same request-scoped `AsyncSession` (FastAPI caches `Depends(get_session)` per request by default).
+
+**The autobegin trap.** SQLAlchemy 2.x sessions *autobegin*: the first `get` / `execute` / `flush` silently opens a transaction. Calling `session.begin()` on a session that is already in one raises `InvalidRequestError: A transaction is already begun on this Session.` So:
+
+- In a write use case, `async with self._session.begin():` is the first thing that touches the session. Loads go inside the block, not before it:
+
+  ```python
+  # bad — get_or_raise autobegins, then begin() raises
+  order = await self._orders.get_or_raise(cmd.order_id)
+  async with self._session.begin():
+      order.cancel(reason=cmd.reason)
+
+  # good
+  async with self._session.begin():
+      order = await self._orders.get_or_raise(cmd.order_id)
+      order.cancel(reason=cmd.reason)
+  ```
+
+- Read-only use cases skip `begin()`. Autobegin is fine there; `get_session` closes the session (and its implicit transaction) at the end of the request.
+- Several `begin()` blocks in one method are fine — commit, call an external API, record the result in a second transaction — as long as nothing touches the session *between* them.
+- A dependency that runs before the route and needs the DB (auth, tenant resolution) must not use the request session, or it autobegins the transaction the use case is about to open. Give it its own short-lived session:
+
+  ```python
+  # app/deps/auth.py
+  async def get_current_user(
+      request: Request,
+      user_id: Annotated[UUID, Depends(get_user_id_from_token)],
+  ) -> UserGet:
+      factory: async_sessionmaker[AsyncSession] = request.app.state.db_session_factory
+      async with factory() as session:
+          return UserGet.from_model(await UserRepo(session).get_or_raise(user_id))
+  ```
 
 Don't compose committing service methods. If `CheckoutService.place_order()` needs inventory reservation, don't call `InventoryService.reserve_command()` if that method owns its own transaction. Extract a non-committing collaborator operation:
 

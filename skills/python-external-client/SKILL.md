@@ -5,12 +5,17 @@ description: |
   service, LLM provider, etc.) into a typed Python client class. Triggers on
   edits to `app/clients/`; on imports of `httpx`, `tenacity`; on user questions
   about HTTP clients, retries, mocking external APIs, `MockTransport`, client
-  lifecycle. Encodes: `BaseHTTPClient` with `httpx.AsyncClient` + tenacity retry,
-  per-client `init_X_client` / `cleanup_X_client` async functions, schemas know
+  lifecycle. Encodes: `BaseHTTPClient` with `httpx.AsyncClient` + tenacity retry
+  (transient failures, repeat-safe requests only), one exception base per client
+  mapped to 502/503, per-client `init_X_client` / `cleanup_X_client`, schemas know
   the wire shape via `from_X` / `to_X`, `httpx.MockTransport` for tests (no
   aiohttp dep), YAGNI on method surface.
   Do NOT use for: database access (use python-aggregate-and-repo); internal
   service-to-service in-process calls (just call the service).
+license: MIT
+compatibility: Python 3.12+ services using FastAPI, httpx, and tenacity.
+metadata:
+  tier: service
 ---
 
 # External HTTP client pattern
@@ -58,9 +63,17 @@ class BaseHTTPClient:
     async def close(self) -> None:
         await self._http.aclose()
 
-    async def _request(self, method: HTTPMethod, url: str, **kwargs: Any) -> httpx.Response:
-        # tenacity AsyncRetrying with stop_after_attempt(config.MAX_RETRIES) +
-        # wait_exponential, retrying on TransportError and HTTPStatusError.
+    async def _request(
+        self,
+        method: HTTPMethod,
+        url: str,
+        *,
+        retry: bool | None = None,      # None → retry only GET/HEAD/OPTIONS (rule 8)
+        **kwargs: Any,
+    ) -> httpx.Response:
+        # tenacity AsyncRetrying: up to 1 + config.MAX_RETRIES attempts with
+        # wait_exponential, retrying only transient failures (transport errors,
+        # 429, 5xx) and only when the request is safe to repeat.
         ...
 ```
 
@@ -77,7 +90,7 @@ class BaseHTTPClientConfig(BaseSettings):
     TIMEOUT: float = 30.0
     KEEP_ALIVE_CONNECTIONS: int = 10
     MAX_CONNECTIONS: int = 20
-    MAX_RETRIES: int = 3
+    MAX_RETRIES: int = 2                       # retries after the first attempt
 
     def auth_headers(self) -> dict[str, str]:
         return {}                              # default: no auth
@@ -91,7 +104,7 @@ class OpenAIConfig(BaseHTTPClientConfig):
 
 Subclasses inherit this and call `self._request(...)`. Retry policy reads from `self._config`. The `Literal` on `method` makes typos a type error, not a runtime 405.
 
-**URL composition note.** httpx joins the `base_url` set at `AsyncClient` construction with relative paths passed to `request()`. The gotcha: `base_url="https://api.com/v1"` + path `"/foo"` resolves to `https://api.com/foo`, **not** `https://api.com/v1/foo`. Ensure base_url ends with `/` and paths don't start with `/` if you want path-preserving composition. For complex versioned paths, override `_request` to call `urljoin(self._config.BASE_URL, path)` explicitly.
+**URL composition.** httpx *appends* a relative request path to `base_url`'s path. It adds a trailing `/` to `base_url` and strips the leading `/` from the path, so `base_url="https://api.example.com/v1"` + `"/charges"` → `https://api.example.com/v1/charges`, with or without slashes on either side. That is not `urllib.parse.urljoin`, which would drop the `/v1`, so don't rebuild URLs with `urljoin`. Put a version prefix either in `BASE_URL` or in every path, and pick one per client. An absolute URL passed to `request()` ignores `base_url` entirely.
 
 Why a base class — once you have 3+ clients all needing identical retry + pool semantics, the base class earns its keep. Without it, you copy-paste the same `tenacity` + `httpx` setup into every file.
 
@@ -105,21 +118,18 @@ class OpenAIClient(BaseHTTPClient):
             response = await self._request(
                 "POST",
                 "/v1/chat/completions",
+                retry=True,     # a completion has no side effects beyond cost: safe to repeat
                 json={
                     "model": model or self._config.MODEL,
                     "messages": [m.model_dump() for m in messages],
                 },
             )
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code == status.HTTP_401_UNAUTHORIZED:
-                raise OpenAIAuthException() from exc
-            if exc.response.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
-                raise OpenAIRateLimitedException() from exc
-            raise
+        except httpx.HTTPError as exc:
+            raise OpenAIException.from_http_error(exc) from exc
         return response.json()["choices"][0]["message"]["content"]
 ```
 
-YAGNI: implement only the methods a service actually calls — `chat` is enough for most agent code. Add `embed`, `stream_chat`, or function-calling variants only when a service needs them. Domain exceptions (`OpenAIAuthException`, `OpenAIRateLimitedException`) live in the client file (cohesion); they inherit from the cross-cutting bases in `app/common/exceptions.py`.
+YAGNI: implement only the methods a service actually calls — `chat` is enough for most agent code. Add `embed`, `stream_chat`, or function-calling variants only when a service needs them. The client's exceptions (`OpenAIException` and its subclasses) live in the client file (cohesion); rule 5 covers their hierarchy.
 
 ### 3. Each client module exports `init_X_client` and `cleanup_X_client`
 
@@ -159,8 +169,13 @@ async def init_llm_client(app: FastAPI, config: AppConfig) -> None:
     try:
         build = _BUILDERS[config.llm.PROVIDER]
     except KeyError:
-        raise ValueError(f"unknown LLM provider: {config.llm.PROVIDER}")
+        raise ValueError(f"unknown LLM provider: {config.llm.PROVIDER}") from None
     app.state.llm_client = build(config)
+
+
+async def cleanup_llm_client(app: FastAPI) -> None:
+    if hasattr(app.state, "llm_client"):
+        await app.state.llm_client.close()
 
 
 # app/deps/clients.py
@@ -187,29 +202,43 @@ class AIAssistantService:
 
 **When the Protocol earns its keep:** 2+ providers for the same role. For single-provider clients (Stripe, your CRM), skip the Protocol — just inject the concrete class directly.
 
-### 5. Domain exceptions inherit from `app/common/exceptions.py` bases
-
-`OpenAIAuthException` extends `NotAuthenticatedException`, which the global handler maps to 401. The client raises domain words; the HTTP layer translates.
+### 5. One exception base per client; upstream failures map to 502/503
 
 ```python
-class OpenAIAuthException(NotAuthenticatedException): ...
-class OpenAIRateLimitedException(RateLimitedException): ...
+# app/common/exceptions.py
+class UpstreamException(AppException): ...                    # → 502: a system we call failed
+class UpstreamUnavailableException(UpstreamException): ...    # → 503: it's down or throttling us; retry later
+
+
+# app/clients/openai.py — full version in examples/openai_client.py
+class OpenAIException(UpstreamException): ...                                          # → 502
+class OpenAIAuthException(OpenAIException): ...                                        # → 502
+class OpenAIUnavailableException(OpenAIException, UpstreamUnavailableException): ...   # → 503
+class OpenAIRateLimitedException(OpenAIUnavailableException): ...                      # → 503
 ```
 
-Concrete exception classes live in the client file (cohesion). Bases live in `app/common/exceptions.py`.
+Two rules:
+
+- **Every exception a client raises inherits that client's base.** A service that has to react to *any* OpenAI failure — mark a payment attempt failed, fall back to another provider — catches one class: `except OpenAIException`. Without the shared base, the service catches the one subclass its author thought of; a sibling (rejected, rate limited) slips past and leaves state half-updated.
+- **Upstream failures surface as 502/503, never as the upstream's own status.** OpenAI answering 401 means *our* API key is wrong — the end user is authenticated fine. Mapping it to `NotAuthenticatedException` would tell the caller to log in again; a 502 tells them, and your alerting, that a dependency failed. Only "down, timing out, or throttling us" (`UpstreamUnavailableException`) becomes 503.
+
+The exception handlers find the status by walking the exception's MRO (`python-fastapi-sa-app-setup` rule 5), so `OpenAIRateLimitedException` resolves to 503 through `UpstreamUnavailableException` before it reaches `UpstreamException`. Concrete classes live in the client file (cohesion); the bases live in `app/common/exceptions.py`.
 
 ### 6. Test with `httpx.MockTransport` — no aiohttp, no extra deps
 
 ```python
 # tests/doubles/openai.py — shape; full version in examples/openai_mock.py
 class OpenAIMock:
-    """Stateful httpx.MockTransport handler — supports per-test response setup."""
+    requests: list[httpx.Request]            # every request it served, for assertions
 
+    def reset(self) -> None: ...             # back to defaults — called between tests
     def set_chat_response(self, response: dict[str, Any], *, http_status: int = 200) -> None: ...
+    def queue_chat_responses(self, *responses: tuple[int, dict[str, Any]]) -> None: ...  # e.g. 503 then 200
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
         if request.method == "POST" and request.url.path == "/v1/chat/completions":
-            return httpx.Response(self._chat_status, json=self._chat_response)
+            ...                              # serve the next configured response
         return httpx.Response(status.HTTP_404_NOT_FOUND, json={"detail": "unmocked endpoint"})
 ```
 
@@ -221,7 +250,7 @@ In tests:
 async def openai_mock_and_client() -> tuple[OpenAIMock, OpenAIClient]:
     mock = OpenAIMock()
     http = httpx.AsyncClient(transport=httpx.MockTransport(mock), base_url="https://api.openai.test")
-    config = OpenAIConfig(API_KEY="test", BASE_URL="https://api.openai.test", MAX_RETRIES=1)
+    config = OpenAIConfig(API_KEY="test", BASE_URL="https://api.openai.test", MAX_RETRIES=0)
     return mock, OpenAIClient(http=http, config=config)
 
 
@@ -232,7 +261,17 @@ async def test_chat_returns_assistant_reply(openai_mock_and_client):
     answer = await client.chat([ChatMessage(role="user", content="hi")])
 
     assert answer == "hello"
+
+
+async def test_rejected_api_key_is_an_upstream_failure(openai_mock_and_client):
+    mock, client = openai_mock_and_client
+    mock.set_chat_response({"error": "invalid key"}, http_status=401)
+
+    with pytest.raises(OpenAIAuthException):
+        await client.chat([ChatMessage(role="user", content="hi")])
 ```
+
+`MAX_RETRIES=0` keeps failure tests fast: one attempt, no backoff sleeps. To test the retry policy itself, set it to 1 or more, queue `(503, ...)` then `(200, ...)` with `queue_chat_responses`, and assert on `len(mock.requests)`.
 
 The mock is a callable class: `__call__(self, request: httpx.Request) -> httpx.Response`. `httpx.MockTransport(mock)` plugs it into the client. No HTTP socket, no port allocation, no aiohttp dep — fastest possible test loop.
 
@@ -250,43 +289,57 @@ Per-request `headers={...}` adds noise to every method. Put the auth in `init`; 
 
 For OAuth flows that need refresh, write an `httpx.Auth` subclass and pass it as `auth=` to the `AsyncClient`.
 
-### 8. Retry policy: connect errors + 5xx; idempotent operations only
+### 8. Retry policy: transient failures only, and only requests that are safe to repeat
 
-The default in `BaseHTTPClient._request` retries on `httpx.TransportError` (connection errors) and `httpx.HTTPStatusError` (any 4xx/5xx after `raise_for_status()`).
+`_request` retries only when **both** conditions hold:
 
-This is too eager for POST endpoints that aren't idempotent (you could double-create things on retry). For non-idempotent endpoints, override:
+- **The failure is transient:** `httpx.TransportError` (connect, read, timeout), 429, or 5xx. Other 4xx responses are never retried — a 400, 401, 404, or 422 fails the same way every time, so retrying only adds latency and load.
+- **The request is safe to repeat:** by default that means `GET`, `HEAD`, and `OPTIONS` only. Any other method is sent once unless the client method passes `retry=True`. That flag is a per-endpoint claim *you* make: the request carries an idempotency key, or it has no side effects (an LLM completion costs money but changes nothing).
+
+A timeout on a `POST` is the dangerous case: the server may already have done the work. That's why non-idempotent requests aren't retried by default.
 
 ```python
 class StripeClient(BaseHTTPClient):
-    async def charge(self, *, amount: Decimal, customer_id: UUID) -> ChargeGet:
-        # don't retry charges — could double-charge
-        response = await self._http.post(
+    async def charge(self, *, amount: Decimal, customer_id: UUID, idempotency_key: str) -> ChargeGet:
+        response = await self._request(
+            "POST",
             "/v1/charges",
+            retry=True,                                   # safe: Stripe dedupes on the key
+            headers={"Idempotency-Key": idempotency_key},
             json={"amount": int(amount * 100), "customer_id": str(customer_id)},
-            headers={"Idempotency-Key": str(uuid4())},
         )
-        response.raise_for_status()
         return ChargeGet.from_stripe(response.json())
 ```
 
-Or pass an idempotency key and let retries through (Stripe-style).
-
-The conservative default is: retry only `GET`. Other verbs need per-method consideration.
+The idempotency key comes from the caller and names the **business operation**, e.g. `f"order-{order.id}-charge"`. It stays the same across HTTP retries, across outbox redeliveries, and across a user double-clicking "pay". A fresh `uuid4()` per call protects nothing, because every retry then looks like a new charge.
 
 ### 9. Errors are domain exceptions, not raw `httpx` exceptions
 
 ```python
+class OpenAIException(UpstreamException):
+    @classmethod
+    def from_http_error(cls, exc: httpx.HTTPError) -> OpenAIException:
+        if not isinstance(exc, httpx.HTTPStatusError):
+            return OpenAIUnavailableException(f"openai unreachable: {exc!r}")   # transport error
+        match exc.response.status_code:
+            case status.HTTP_401_UNAUTHORIZED | status.HTTP_403_FORBIDDEN:
+                return OpenAIAuthException()
+            case status.HTTP_429_TOO_MANY_REQUESTS:
+                return OpenAIRateLimitedException()
+            case code if code >= status.HTTP_500_INTERNAL_SERVER_ERROR:
+                return OpenAIUnavailableException(f"openai returned {code}")
+            case code:
+                return OpenAIException(f"openai returned {code}")
+
+
+# every client method
 try:
-    response = await self._request("POST", "/v1/chat/completions", json={...})
-except httpx.HTTPStatusError as exc:
-    if exc.response.status_code == status.HTTP_401_UNAUTHORIZED:
-        raise OpenAIAuthException() from exc
-    if exc.response.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
-        raise OpenAIRateLimitedException() from exc
-    raise
+    response = await self._request("POST", "/v1/chat/completions", retry=True, json={...})
+except httpx.HTTPError as exc:
+    raise OpenAIException.from_http_error(exc) from exc
 ```
 
-`httpx.HTTPStatusError` escapes the client only when there's no domain-specific handling. Otherwise translate at the boundary — the rest of the app deals in `OpenAIAuthException`, not `httpx.HTTPStatusError`.
+Catch `httpx.HTTPError` (the parent of both status and transport errors) and translate everything. The translation is one `from_http_error` classmethod on the client's base exception, so every method maps errors the same way. No `httpx` exception escapes the client; the rest of the app deals in `OpenAIException` and its subclasses.
 
 ### 10. `BaseHTTPClient.close()` is idempotent
 

@@ -3,8 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Self
 
+from app.common.exceptions import InvalidInputException
 
-class InvalidEmailException(ValueError):
+
+class InvalidEmailException(InvalidInputException):
     def __init__(self, value: str) -> None:
         super().__init__(f"not a valid email: {value!r}")
 

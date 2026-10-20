@@ -9,6 +9,10 @@ description: |
   skill has the detail.
   Do NOT use for: deep dives — this is the quick lookup. Each entry points to
   the positive skill with the full alternative.
+license: MIT
+compatibility: Python 3.12+.
+metadata:
+  tier: python
 ---
 
 # Anti-pattern cheatsheet

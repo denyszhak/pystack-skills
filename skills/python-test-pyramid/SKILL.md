@@ -11,6 +11,10 @@ description: |
   app.state setup in fixtures, httpx.MockTransport for external clients, no
   unittest.mock / pytest-mock, no factory libs, unit/integration/api split.
   Do NOT use for: testing libraries, scripts, or non-FastAPI Python.
+license: MIT
+compatibility: Python 3.12+ services; pytest, pytest-asyncio, httpx, and a reachable PostgreSQL.
+metadata:
+  tier: service
 ---
 
 # Test pyramid for FastAPI + SQLAlchemy
@@ -63,10 +67,14 @@ pytest_plugins = [
 
 @pytest.fixture(scope="session")
 def config() -> AppConfig:
-    return AppConfig()
+    base = AppConfig()
+    name = base.db.NAME if base.db.NAME.endswith("_test") else f"{base.db.NAME}_test"
+    return base.model_copy(update={"ENV": "test", "db": base.db.model_copy(update={"NAME": name})})
 ```
 
 Splitting fixtures into `tests/fixtures/*.py` keeps `conftest.py` short and lets you find a fixture by topic.
+
+The test config always points at a database whose name ends in `_test`, because `setup_database` (rule 2) drops and recreates it. Without that suffix, a developer whose `.env` says `DB_NAME=myapp` would lose their dev database on the first test run. Importing `app.setup` also builds the module-level `app` from the environment (`python-fastapi-sa-app-setup` rule 1), so settings the app requires at import, such as `OPENAI_API_KEY`, must be present in the test environment. Any value will do.
 
 ### 2. Real Postgres, set up once per test session
 
@@ -82,7 +90,7 @@ def setup_database(config: AppConfig) -> Iterator[None]:
 
 - Use `config.db.sync_url()` to get a sync URL (Alembic + admin connections need sync)
 - Connect to the `postgres` admin DB via `.set(database="postgres")` — no string-replace needed
-- `DROP DATABASE IF EXISTS` to clean up any leftover, then `CREATE DATABASE` fresh
+- `DROP DATABASE IF EXISTS ... WITH (FORCE)` to clean up any leftover (and its open connections), then `CREATE DATABASE` fresh — and refuse to drop any name that doesn't end in `_test`
 - Run Alembic migrations to head (Alembic gets `config.db.sync_url()` too)
 - Test session runs against this DB; teardown drops again
 
@@ -92,16 +100,20 @@ def setup_database(config: AppConfig) -> Iterator[None]:
 
 ```python
 @pytest_asyncio.fixture(scope="session")
-async def app(config: AppConfig, setup_database: None, openai_client, ...) -> FastAPI:
+async def app(
+    config: AppConfig,
+    setup_database: None,
+    openai_client: OpenAIClient,          # session-scoped too (rule 6)
+) -> AsyncIterator[FastAPI]:
     app = provide_app(config)
     # Skip lifespan; set app.state manually so fake clients stay fake.
-    app.state.db_pool = await provide_async_db_pool(config.db)
-    app.state.db_session_factory = async_sessionmaker(app.state.db_pool, expire_on_commit=False)
-    app.state.openai_client = openai_client
-    return app
+    await init_db_pool(app, config.db)    # same pool + session factory as production
+    app.state.llm_client = openai_client  # same app.state name the lifespan uses
+    yield app
+    await close_db_pool(app)
 ```
 
-`provide_app(config)` builds the FastAPI app but `lifespan` doesn't run in this fixture — so you set `app.state.*` manually, with fake clients in place of real ones. Precise control over what's real (DB) vs doubled (external systems).
+`provide_app(config)` builds the FastAPI app, but `lifespan` doesn't run in this fixture. So you set `app.state.*` manually, with doubled clients in place of real ones. That gives precise control over what's real (DB) and what's doubled (external systems). Every fixture this one depends on must be session-scoped too: pytest refuses to give a session fixture a function-scoped dependency (`ScopeMismatch`).
 
 If you need lifespan to run (testing the lifespan itself), use `asgi-lifespan.LifespanManager`. For everyday tests, manual `app.state` is simpler.
 
@@ -109,13 +121,13 @@ If you need lifespan to run (testing the lifespan itself), use `asgi-lifespan.Li
 
 ```python
 @pytest_asyncio.fixture
-async def client(app: FastAPI) -> AsyncClient:
+async def client(app: FastAPI) -> AsyncIterator[AsyncClient]:
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as c:
         yield c
 
 @pytest_asyncio.fixture
-async def session(app: FastAPI) -> AsyncSession:
-    async with AsyncSession(app.state.db_pool, expire_on_commit=False) as s:
+async def session(app: FastAPI) -> AsyncIterator[AsyncSession]:
+    async with app.state.db_session_factory() as s:
         yield s
 ```
 
@@ -144,28 +156,40 @@ Why not `TestClient`: it's synchronous (uses `anyio.from_thread` under the hood)
 In `tests/fixtures/clients.py`:
 
 ```python
-import pytest_asyncio
+from collections.abc import AsyncIterator
+
 import httpx
+import pytest
+import pytest_asyncio
 
 from app.clients.openai import OpenAIClient
 from app.config import OpenAIConfig
 from tests.doubles.openai import OpenAIMock
 
 
-@pytest_asyncio.fixture
-async def openai_mock() -> OpenAIMock:
+@pytest.fixture(scope="session")
+def openai_mock() -> OpenAIMock:
     return OpenAIMock()
 
 
-@pytest_asyncio.fixture
-async def openai_client(openai_mock: OpenAIMock) -> OpenAIClient:
+@pytest_asyncio.fixture(scope="session")
+async def openai_client(openai_mock: OpenAIMock) -> AsyncIterator[OpenAIClient]:
     http = httpx.AsyncClient(
         transport=httpx.MockTransport(openai_mock),
         base_url="https://api.openai.test",
     )
-    config = OpenAIConfig(WEBHOOK="test", BASE_URL="https://api.openai.test", MAX_RETRIES=1)
-    return OpenAIClient(http=http, config=config)
+    config = OpenAIConfig(API_KEY="test", BASE_URL="https://api.openai.test", MAX_RETRIES=0)
+    client = OpenAIClient(http=http, config=config)
+    yield client
+    await client.close()
+
+
+@pytest.fixture(autouse=True)
+def _reset_openai_mock(openai_mock: OpenAIMock) -> None:
+    openai_mock.reset()
 ```
+
+The double and the client are **session-scoped** because the session-scoped `app` holds the client (rule 3). Per-test isolation comes from the autouse `reset()`, which clears the configured responses and the recorded requests before every test. Rebuilding the double per test wouldn't help, since the app would still hold the old one. `MAX_RETRIES=0` keeps failure-path tests from sleeping through backoff.
 
 The mock is a callable class (`tests/doubles/openai.py`); tests interact with it to set responses per-case:
 
@@ -251,16 +275,20 @@ async def test_place_order_creates_order(client: AsyncClient):
 
 Mirror means "find the source file's tests fast." Pytest doesn't require this — it's a discipline.
 
-### 11. `pytest-asyncio` mode = `auto`, mark only when overriding
+### 11. `pytest-asyncio`: `auto` mode, one session-wide event loop
 
 In `pyproject.toml`:
 
 ```toml
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
 ```
 
-This makes `async def test_...` work without `@pytest.mark.asyncio` on every test. Use the mark only to override scope (`@pytest.mark.asyncio(scope="session")` on a session-scoped async fixture).
+`asyncio_mode = "auto"` makes `async def test_...` work without `@pytest.mark.asyncio` on every test.
+
+The two loop-scope settings are what make the session-scoped `app` fixture work at all. That fixture opens an asyncpg pool, and asyncpg connections belong to the event loop that created them. By default, pytest-asyncio runs each test on its own function-scoped loop; the first test that touches the pool then fails with "attached to a different loop" or "another operation is in progress". Run every fixture and test on one session loop. Don't define an `event_loop` fixture to achieve this: pytest-asyncio 1.0 removed it. To give one test its own loop, mark it `@pytest.mark.asyncio(loop_scope="function")`.
 
 ## When to break these rules
 

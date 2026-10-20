@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from typing import Protocol
 
 from fastapi import FastAPI
@@ -30,7 +30,7 @@ async def init_llm_client(app: FastAPI, config: AppConfig) -> None:
     try:
         build = _BUILDERS[config.llm.PROVIDER]
     except KeyError:
-        raise ValueError(f"unknown LLM provider: {config.llm.PROVIDER}")
+        raise ValueError(f"unknown LLM provider: {config.llm.PROVIDER}") from None
     app.state.llm_client = build(config)
 
 

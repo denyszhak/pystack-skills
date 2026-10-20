@@ -4,10 +4,11 @@ The locked decisions behind every skill in this repo. Read this once; the indivi
 
 ## Target
 
-A **typed Python backend service** — FastAPI HTTP API, SQLAlchemy 2.0 async, Pydantic v2, external HTTP clients (`httpx`), Postgres. Not libraries, scripts, CLIs, or notebooks.
+A **typed Python 3.12+ backend service** — FastAPI HTTP API, SQLAlchemy 2.x async, Pydantic v2, external HTTP clients (`httpx`), Postgres. Not libraries, scripts, CLIs, or notebooks.
 
 ## Tooling
 
+- **Python:** 3.12+ (`requires-python = ">=3.12"`). PEP 695 generics and `type` aliases are used throughout; `TypeIs` comes from `typing_extensions` until the baseline reaches 3.13.
 - **Package manager:** `uv`
 - **Formatter / linter:** `ruff`
 - **Type checker:** `ty` (Astral's new type checker, not `mypy`)
@@ -23,6 +24,7 @@ app/
   config.py             # AppConfig + sub-Config (DBConfig, OpenAIConfig, ...)
   common/
     exceptions.py       # AppException, NotFoundException, ConflictException, ...
+    value_objects.py    # shared value objects (Money, EmailAddress)
   db/                   # init_db_pool, close_db_pool, provide_async_db_pool
   deps/                 # FastAPI Depends providers, one file per layer
     db.py               # get_session
@@ -63,9 +65,9 @@ tests/
 
 5. **Application services orchestrate; pure domain services decide.** A service method may load repos, call clients, own a transaction, and return a schema. When a business decision is pure, spans multiple objects, and no longer belongs cleanly on one aggregate/value object, extract a small sync domain service or policy. It takes domain data in, returns domain data out, and knows nothing about FastAPI, Pydantic, `AsyncSession`, repos, or HTTP clients.
 
-6. **One use case → one transaction owner.** A top-level service command method wraps writes in `async with session.begin()`. SQLAlchemy commits on success and rolls back on exception. Routes don't begin or commit. Repos don't begin or commit. Composable collaborators assume the caller already owns the transaction.
+6. **One use case → one transaction owner.** A top-level service command method wraps writes in `async with session.begin()`. SQLAlchemy commits on success and rolls back on exception. Routes don't begin or commit. Repos don't begin or commit. Composable collaborators assume the caller already owns the transaction. Because sessions autobegin, the `begin()` block is the first thing that touches the session; dependencies that need the DB before the route runs (auth) use their own short-lived session.
 
-7. **Errors are typed and routed by base class.** Domain exceptions inherit from `AppException → NotFoundException / ConflictException / InvalidInputException / NotAuthenticatedException / NotAuthorizedException`. One `@app.exception_handler` per HTTP code, registered in `setup.py`. Routes never `try/except`.
+7. **Errors are typed and routed by base class.** Domain exceptions inherit from `AppException → NotFoundException / ConflictException / InvalidInputException / NotAuthenticatedException / NotAuthorizedException`; external-client exceptions inherit from `UpstreamException` (502) or `UpstreamUnavailableException` (503). One table in `app/api/exception_handlers.py` maps each base to its HTTP status, and a single handler registered for `AppException` serves them all. Routes never `try/except`.
 
 8. **Real DB in tests, protocol-level doubles for external systems.** Postgres runs locally or in compose. Each test session creates and drops a fresh DB. Outbound HTTP is faked via `httpx.MockTransport`; non-HTTP external systems get purpose-built fakes in `tests/doubles/`. Avoid `unittest.mock`, `pytest-mock`, and ORM mocks by default.
 

@@ -34,7 +34,12 @@ class OrderRepo:
             raise UniqueViolationException(f"order {order.id} already exists") from exc
 
     async def save(self, order: Order) -> None:
-        await self._session.merge(order)
+        # `order` came from this session and is already tracked: flush writes its
+        # changes now. Never merge() here — see SKILL.md rule 5.
+        try:
+            await self._session.flush()
+        except IntegrityError as exc:
+            raise UniqueViolationException(f"order {order.id} conflicts with an existing row") from exc
 
     async def list_for_customer(self, customer_id: UUID) -> AsyncIterator[Order]:
         stmt = select(Order).where(Order.customer_id == customer_id)

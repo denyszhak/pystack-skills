@@ -1,0 +1,51 @@
+{
+  "name": "pystack-skills",
+  "owner": {
+    "name": "Denys Zhak"
+  },
+  "description": "Opinionated agent skills for typed Python backend services: FastAPI, Pydantic v2, SQLAlchemy 2.x async, PostgreSQL.",
+  "plugins": [
+    {
+      "name": "pystack-python",
+      "source": "./",
+      "description": "Typed-Python idioms for any project: typing, value objects, iteration and tree shapes, GoF anti-pattern redirects.",
+      "license": "MIT",
+      "repository": "https://github.com/denyszhak/pystack-skills",
+      "keywords": ["python", "typing", "value-objects"],
+      "skills": [
+        "./skills/python-typing-idioms",
+        "./skills/python-value-objects",
+        "./skills/python-stdlib-idioms",
+        "./skills/python-antipatterns-cheatsheet"
+      ]
+    },
+    {
+      "name": "pystack-service",
+      "source": "./",
+      "description": "FastAPI + SQLAlchemy service shape: app setup, aggregates and repos, services and schemas, external clients, logging, tests.",
+      "license": "MIT",
+      "repository": "https://github.com/denyszhak/pystack-skills",
+      "keywords": ["python", "fastapi", "sqlalchemy", "pydantic", "postgres"],
+      "skills": [
+        "./skills/python-fastapi-sa-app-setup",
+        "./skills/python-aggregate-and-repo",
+        "./skills/python-service-and-schema-cohesion",
+        "./skills/python-external-client",
+        "./skills/python-structlog-logging",
+        "./skills/python-test-pyramid"
+      ]
+    },
+    {
+      "name": "pystack-opt-in",
+      "source": "./",
+      "description": "Opt-in patterns: a framework-free domain layer, and domain events with a message bus and outbox.",
+      "license": "MIT",
+      "repository": "https://github.com/denyszhak/pystack-skills",
+      "keywords": ["python", "ddd", "outbox", "events"],
+      "skills": [
+        "./skills/python-pure-domain-layer",
+        "./skills/python-message-bus-outbox"
+      ]
+    }
+  ]
+}

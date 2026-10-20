@@ -10,6 +10,10 @@ description: |
   over event handlers, providers in `app/deps/`, exception handlers grouped by
   HTTP status, manual `app.state.*` setup in tests.
   Do NOT use for: scripts, CLIs, libraries, or codebases that aren't FastAPI services.
+license: MIT
+compatibility: Python 3.12+ services using FastAPI, Pydantic v2, SQLAlchemy 2.x (async), and PostgreSQL.
+metadata:
+  tier: service
 ---
 
 # FastAPI + SQLAlchemy app setup
@@ -32,6 +36,7 @@ app/
   common/
     exceptions.py       # AppException base + NotFoundException, ConflictException, ...
     logging.py          # configure_logging(env=...), contextvar correlation_id
+    value_objects.py    # shared value objects (Money, EmailAddress) — see python-value-objects
   db/
     __init__.py         # init_db_pool, close_db_pool, provide_async_db_pool
   deps/
@@ -83,8 +88,8 @@ def provide_app(config: AppConfig) -> FastAPI:
     configure_logging(env=config.ENV)
     app = FastAPI(title=config.NAME, debug=config.DEBUG, lifespan=lifespan, ...)
     app.state.config = config
-    _add_middleware(app)
-    _register_exception_handlers(app)
+    _add_middleware(app, config)
+    register_exception_handlers(app)           # from app/api/exception_handlers.py (rule 5)
     _include_routers(app)
     return app
 
@@ -93,7 +98,7 @@ app_config = AppConfig()
 app = provide_app(app_config)         # ASGI handle at module level
 ```
 
-`_add_middleware`, `_register_exception_handlers`, `_include_routers` are private helpers in the same module. They keep `provide_app` short and let each concern be tested or extended independently.
+`_add_middleware` and `_include_routers` are private helpers in the same module; `register_exception_handlers` lives with the handlers it registers. They keep `provide_app` short and let each concern be tested or extended independently.
 
 The factory makes tests trivial: build a `FastAPI` with a custom `AppConfig`, set `app.state.*` manually for mocked deps.
 
@@ -111,8 +116,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await init_db_pool(app, config.db)
         stack.push_async_callback(close_db_pool, app)
 
-        await init_openai_client(app, config.openai)
-        stack.push_async_callback(cleanup_openai_client, app)
+        await init_stripe_client(app, config.stripe)
+        stack.push_async_callback(cleanup_stripe_client, app)
+
+        await init_llm_client(app, config)              # provider chosen by config.llm.PROVIDER
+        stack.push_async_callback(cleanup_llm_client, app)
 
         # ... each resource: init, then register its cleanup
         yield
@@ -127,85 +135,34 @@ Each `init_X_client` / `cleanup_X_client` lives in its client's own module (see 
 ### 3. `AppConfig` aggregates sub-configs; env-prefix per sub-config
 
 ```python
-# app/config.py
-import os
-from typing import Literal
-from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
-
-
-BASE_SETTINGS_CONFIG = SettingsConfigDict(
-    env_file=".env",
-    env_file_encoding="utf-8",
-    extra="ignore",
-)
-
-
-class BaseHTTPClientConfig(BaseSettings):
-    BASE_URL: str = ""
-    KEEP_ALIVE_CONNECTIONS: int = 10
-    MAX_CONNECTIONS: int = 20
-    MAX_RETRIES: int = 3
-    TIMEOUT: float = 30.0
-
-    def auth_headers(self) -> dict[str, str]:
-        return {}                                   # subclasses override per system
+# app/config.py — shape; full version in examples/config.py
+BASE_SETTINGS_CONFIG = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
 
 class DBConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="DB_", **BASE_SETTINGS_CONFIG)
-    DRIVER: str = "postgresql+asyncpg"           # async driver by default
     HOST: str = "localhost"
-    PORT: int = 5432
-    USER: str = "postgres"
-    PASSWORD: str = "password"
     NAME: str = "postgres"
-    POOL_SIZE: int = 5
-    POOL_OVERFLOW: int = 10
-    POOL_RECYCLE: int = 3600
-    ECHO: bool = False
+    # ... DRIVER, PORT, USER, PASSWORD, POOL_SIZE, POOL_OVERFLOW, POOL_RECYCLE, ECHO
 
     @property
-    def url(self) -> URL:
-        return URL.create(
-            drivername=self.DRIVER,
-            username=self.USER,
-            password=self.PASSWORD,
-            host=self.HOST,
-            port=self.PORT,
-            database=self.NAME,
-        )
-
-    def sync_url(self, driver: str = "postgresql") -> URL:
-        return self.url.set(drivername=driver)   # for Alembic + test bootstrap
-
-    @property
-    def PATH(self) -> str:
-        return f"{self.HOST}:{self.PORT}/{self.NAME}"
+    def url(self) -> URL: ...                       # URL.create(...) — derived values are properties
 
 
-class OpenAIConfig(BaseHTTPClientConfig):
+class OpenAIConfig(BaseHTTPClientConfig):           # shares pool / retry / timeout knobs with other clients
     model_config = SettingsConfigDict(env_prefix="OPENAI_", **BASE_SETTINGS_CONFIG)
-    BASE_URL: str = "https://api.openai.com"
     API_KEY: str
-    MODEL: str = "gpt-4o-mini"
 
-    def auth_headers(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self.API_KEY}"}
+    def auth_headers(self) -> dict[str, str]: ...
 
 
 class AppConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="APP_", **BASE_SETTINGS_CONFIG)
-    ENV: Literal["local", "dev", "staging", "production"] = "local"
-    HOST: str = "0.0.0.0"
-    PORT: int = 8080
-    NAME: str = "My Service"
-    VERSION: str = "1.0.0"
-    DEBUG: bool = False
-
+    ENV: Literal["local", "test", "dev", "staging", "production"] = "local"
+    CORS_ORIGINS: list[str] = []                    # exact browser origins; empty = no CORS (rule 6)
     db: DBConfig = Field(default_factory=DBConfig)
     openai: OpenAIConfig = Field(default_factory=OpenAIConfig)
-    # ... more
+    # ... NAME, VERSION, DEBUG, more sub-configs
 ```
 
 Rules:
@@ -239,12 +196,19 @@ async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
 ```python
 # app/deps/clients.py
 from fastapi import Request
-from app.clients.openai import OpenAIClient
+from app.clients.llm import LLMClient
+from app.clients.stripe import StripeClient
 
 
-def get_openai_client(request: Request) -> OpenAIClient:
+def get_stripe_client(request: Request) -> StripeClient:
+    return request.app.state.stripe_client
+
+
+def get_llm_client(request: Request) -> LLMClient:
     return request.app.state.llm_client
 ```
+
+A provider returns the type the service depends on. For a single-provider client that's the concrete class (`StripeClient`). For a role with several interchangeable providers it's the role's `Protocol` (`LLMClient`, see `python-external-client` rule 4) — never the concrete `OpenAIClient`, or swapping `LLM_PROVIDER` would leave services typed against the wrong class.
 
 ```python
 # app/deps/repos.py
@@ -266,102 +230,134 @@ def get_order_repo(
 from typing import Annotated
 from fastapi import Depends
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.clients.openai import OpenAIClient
-from app.deps.clients import get_openai_client
+from app.clients.llm import LLMClient
+from app.clients.stripe import StripeClient
+from app.deps.clients import get_llm_client, get_stripe_client
 from app.deps.db import get_session
 from app.deps.repos import get_order_repo
 from app.repos.order import OrderRepo
+from app.services.ai_assistant import AIAssistantService
 from app.services.checkout import CheckoutService
 
 
 def get_checkout_service(
     orders: Annotated[OrderRepo, Depends(get_order_repo)],
-    llm: Annotated[OpenAIClient, Depends(get_openai_client)],
+    stripe: Annotated[StripeClient, Depends(get_stripe_client)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> CheckoutService:
-    return CheckoutService(orders=orders, llm=llm, session=session)
+    return CheckoutService(orders=orders, stripe=stripe, session=session)
+
+
+def get_ai_assistant_service(
+    llm: Annotated[LLMClient, Depends(get_llm_client)],
+) -> AIAssistantService:
+    return AIAssistantService(llm=llm)
 ```
 
 Layer dependency flow: routers import only from `deps/services`; `deps/services` builds on `deps/repos` + `deps/clients` + `deps/db`. Lower layers never import higher.
 
-### 5. Exception handlers grouped by HTTP status, one per file in `api/exception_handlers.py`
-
-```python
-# app/api/exception_handlers.py
-import logging
-from fastapi import HTTPException, Request, status
-from fastapi.exceptions import RequestValidationError
-from fastapi.responses import ORJSONResponse
-from pydantic import ValidationError
-from app.common.exceptions import (
-    AppException,
-    ConflictException,
-    NotFoundException,
-    UniqueViolationException,
-)
-
-
-logger = logging.getLogger(__name__)
-
-
-async def http_exception_handler(_: Request, exc: HTTPException) -> ORJSONResponse:
-    if exc.status_code >= status.HTTP_500_INTERNAL_SERVER_ERROR:
-        logger.error(f"internal error: status_code={exc.status_code}, detail={exc.detail}")
-    else:
-        logger.warning(f"client error: status_code={exc.status_code}, detail={exc.detail}")
-    return ORJSONResponse(status_code=exc.status_code, content={"errors": [exc.detail]})
-
-
-async def request_validation_exception_handler(
-    _: Request,
-    exc: RequestValidationError | ValidationError,
-) -> ORJSONResponse:
-    logger.warning(f"validation error: {exc.errors()}")
-    return ORJSONResponse(
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        content={"errors": list(exc.errors())},
-    )
-
-
-async def not_found_exception_handler(_: Request, exc: NotFoundException) -> ORJSONResponse:
-    logger.warning(f"not found: {exc}")
-    return ORJSONResponse(
-        status_code=status.HTTP_404_NOT_FOUND,
-        content={"errors": [str(exc)]},
-    )
-
-
-async def conflict_exception_handler(_: Request, exc: ConflictException) -> ORJSONResponse:
-    logger.warning(f"conflict: {exc}")
-    return ORJSONResponse(
-        status_code=status.HTTP_409_CONFLICT,
-        content={"errors": [str(exc)]},
-    )
-
-
-def register_exception_handlers(app: FastAPI) -> None:
-    app.add_exception_handler(HTTPException, http_exception_handler)
-    app.add_exception_handler(ValidationError, request_validation_exception_handler)
-    app.add_exception_handler(RequestValidationError, request_validation_exception_handler)
-    app.add_exception_handler(NotFoundException, not_found_exception_handler)
-    app.add_exception_handler(ConflictException, conflict_exception_handler)
-```
+### 5. One status table for every exception base, in `api/exception_handlers.py`
 
 The exception hierarchy lives in `app/common/exceptions.py`:
 
 ```python
 # app/common/exceptions.py
 class AppException(Exception): ...
-class NotFoundException(AppException): ...           # → 404
-class ConflictException(AppException): ...           # → 409
 class InvalidInputException(AppException): ...       # → 400
 class NotAuthenticatedException(AppException): ...   # → 401
 class NotAuthorizedException(AppException): ...      # → 403
+class NotFoundException(AppException): ...           # → 404
+class ConflictException(AppException): ...           # → 409
 class UniqueViolationException(ConflictException): ...
+class UpstreamException(AppException): ...           # → 502: a system we call failed
+class UpstreamUnavailableException(UpstreamException): ...  # → 503: it's down or throttling us
 class AsyncDBPoolProvisionException(AppException): ...
 ```
 
-Concrete domain exceptions (e.g. `OrderNotFoundException`) inherit from these and live next to the model they describe (see `python-aggregate-and-repo`).
+```python
+# app/api/exception_handlers.py
+from typing import Final
+
+import structlog
+from fastapi import FastAPI, Request, status
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException
+
+from app.common.exceptions import (
+    AppException,
+    ConflictException,
+    InvalidInputException,
+    NotAuthenticatedException,
+    NotAuthorizedException,
+    NotFoundException,
+    UpstreamException,
+    UpstreamUnavailableException,
+)
+
+
+log = structlog.get_logger(__name__)
+
+# One HTTP status per exception base. An exception gets the status of the first
+# class in its MRO that appears here; anything else is a 500.
+_STATUS_BY_EXCEPTION: Final[dict[type[AppException], int]] = {
+    InvalidInputException: status.HTTP_400_BAD_REQUEST,
+    NotAuthenticatedException: status.HTTP_401_UNAUTHORIZED,
+    NotAuthorizedException: status.HTTP_403_FORBIDDEN,
+    NotFoundException: status.HTTP_404_NOT_FOUND,
+    ConflictException: status.HTTP_409_CONFLICT,
+    UpstreamException: status.HTTP_502_BAD_GATEWAY,
+    UpstreamUnavailableException: status.HTTP_503_SERVICE_UNAVAILABLE,
+}
+
+
+def _status_for(exc: AppException) -> int:
+    return next(
+        (_STATUS_BY_EXCEPTION[cls] for cls in type(exc).__mro__ if cls in _STATUS_BY_EXCEPTION),
+        status.HTTP_500_INTERNAL_SERVER_ERROR,
+    )
+
+
+async def app_exception_handler(_: Request, exc: AppException) -> JSONResponse:
+    status_code = _status_for(exc)
+    emit = log.error if status_code >= status.HTTP_500_INTERNAL_SERVER_ERROR else log.warning
+    emit("request.failed", status=status_code, exception=type(exc).__name__, detail=str(exc))
+    return JSONResponse(status_code=status_code, content={"errors": [str(exc)]})
+
+
+async def http_exception_handler(_: Request, exc: HTTPException) -> JSONResponse:
+    emit = log.error if exc.status_code >= status.HTTP_500_INTERNAL_SERVER_ERROR else log.warning
+    emit("request.http_error", status=exc.status_code, detail=exc.detail)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"errors": [exc.detail]},
+        headers=exc.headers,                       # keep WWW-Authenticate, Retry-After, ...
+    )
+
+
+async def request_validation_exception_handler(_: Request, exc: RequestValidationError) -> JSONResponse:
+    # Log where validation failed, not the offending input — it may contain PII.
+    log.warning("request.invalid", locations=[error["loc"] for error in exc.errors()])
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        content={"errors": jsonable_encoder(exc.errors())},
+    )
+
+
+def register_exception_handlers(app: FastAPI) -> None:
+    app.add_exception_handler(HTTPException, http_exception_handler)
+    app.add_exception_handler(RequestValidationError, request_validation_exception_handler)
+    app.add_exception_handler(AppException, app_exception_handler)
+```
+
+How it routes:
+
+- **`AppException` is registered once.** Starlette sends each raised exception to the closest registered class in its MRO, so every domain exception reaches `app_exception_handler`. `_status_for` then walks the same MRO through the table: `OrderNotFoundException` → 404, and `OpenAIRateLimitedException` → 503 (it hits `UpstreamUnavailableException` before `UpstreamException`). Adding a base means adding one table line. You can't declare a base and forget to register its handler, which used to turn 400/401/403 into 500s.
+- **Only `RequestValidationError` is a 422.** That is FastAPI rejecting the *request*. A bare pydantic `ValidationError` raised inside your own code — a schema that doesn't fit the model it's built from, or a provider payload that changed shape — is a server bug or an upstream failure. It isn't the caller's fault, so it is not registered here and surfaces as a 500. A client parsing a provider response translates it to that client's exception instead, which gives a 502.
+- **`starlette.exceptions.HTTPException`, not FastAPI's.** FastAPI's `HTTPException` subclasses it, so this one handler also catches Starlette's own 404/405 for unknown routes, and every error response has the same `{"errors": [...]}` shape.
+
+Concrete domain exceptions (e.g. `OrderNotFoundException`) inherit from these bases and live next to the model they describe (see `python-aggregate-and-repo`). Client exceptions inherit `UpstreamException` (see `python-external-client` rule 5).
 
 ### 6. Middleware in `api/middleware/`, registered in `provide_app`
 
@@ -388,19 +384,22 @@ class CorrelationIDMiddleware(BaseHTTPMiddleware):
 Register in `provide_app`:
 
 ```python
-def _add_middleware(app: FastAPI) -> None:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+def _add_middleware(app: FastAPI, config: AppConfig) -> None:
+    if config.CORS_ORIGINS:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=config.CORS_ORIGINS,          # exact origins, never "*" with credentials
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
     app.middleware("http")(logging_middleware)
     app.add_middleware(CorrelationIDMiddleware)
 ```
 
 Note: middleware execution order is *reverse* of registration. `CorrelationIDMiddleware` runs first (sets the contextvar) so `logging_middleware` can read it.
+
+**CORS is opt-in, with explicit origins.** `allow_origins=["*"]` together with `allow_credentials=True` doesn't mean "public API". Starlette answers a cookie-carrying request by echoing back whatever `Origin` the browser sent, along with `Access-Control-Allow-Credentials: true`. Any website could then make authenticated requests to your API from a logged-in user's browser and read the responses. List the exact front-end origins in `APP_CORS_ORIGINS`, a JSON list such as `'["https://app.example.com"]'`. With none configured, no CORS middleware is added and browsers keep same-origin rules; a server-to-server API needs nothing more.
 
 ### 7. Routers under `api/`, versioned via subpackages
 
@@ -430,48 +429,17 @@ def _include_routers(app: FastAPI) -> None:
 ### 8. DB pool init with retry; sessionmaker on `app.state`
 
 ```python
-# app/db/__init__.py
-import asyncio
-from collections.abc import AsyncIterator
-from typing import Final
-from fastapi import FastAPI, Request
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import (
-    AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine,
-)
-
-from app.common.exceptions import AsyncDBPoolProvisionException
-from app.config import DBConfig
-
-_HEALTHCHECK: Final = text("SELECT 1;")
-
-
+# app/db/__init__.py — shape; full version in examples/db.py
 async def provide_async_db_pool(
     config: DBConfig,
     *,
     max_retries: int = 3,
     retry_interval: float = 2.0,
 ) -> AsyncEngine:
-    for attempt in range(max_retries + 1):
-        try:
-            pool = create_async_engine(
-                config.ASYNC_DSN,
-                echo=config.ECHO,
-                pool_size=config.POOL_SIZE,
-                max_overflow=config.POOL_OVERFLOW,
-                pool_recycle=config.POOL_RECYCLE,
-                pool_pre_ping=True,
-            )
-            async with pool.begin() as conn:
-                await conn.execute(_HEALTHCHECK)
-            return pool
-        except Exception as exc:
-            if attempt < max_retries:
-                await asyncio.sleep(retry_interval)
-                continue
-            raise AsyncDBPoolProvisionException(
-                f"failed to connect to db at {config.PATH}",
-            ) from exc
+    # Per attempt: create_async_engine(config.url, pool_pre_ping=True, ...) and run SELECT 1.
+    # On failure: dispose that engine (don't leak one per attempt), sleep, retry; after
+    # max_retries raise AsyncDBPoolProvisionException from the last error.
+    ...
 
 
 async def init_db_pool(app: FastAPI, config: DBConfig) -> None:

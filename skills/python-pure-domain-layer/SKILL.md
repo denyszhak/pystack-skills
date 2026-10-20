@@ -12,6 +12,10 @@ description: |
   Do NOT use for: default FastAPI + SA services — use `python-aggregate-and-repo`
   instead. The pure-domain pattern is an opt-in for invariant-dense systems
   (finance, fulfillment, complex state machines).
+license: MIT
+compatibility: Python 3.12+ services using FastAPI, Pydantic v2, SQLAlchemy 2.x (async), and PostgreSQL.
+metadata:
+  tier: opt-in
 ---
 
 # Pure domain layer (Cosmic Python style)
@@ -73,8 +77,6 @@ class Money:
     currency: str
 
     def __post_init__(self) -> None:
-        if self.amount < 0:
-            raise NegativeAmountException(self.amount)
         if len(self.currency) != 3:
             raise InvalidCurrencyException(self.currency)
 
@@ -89,6 +91,10 @@ class OrderLine:
     product_id: ProductId
     quantity: int
     unit_price: Money
+
+    def __post_init__(self) -> None:
+        if self.unit_price.amount < 0:              # Money is signed; a unit price isn't
+            raise NegativeUnitPriceException(self.unit_price)
 
     @property
     def subtotal(self) -> Money:
@@ -119,7 +125,7 @@ type OrderEvent = OrderPlaced | OrderCancelled
 
 # ── Domain errors ─────────────────────────────────────────────────────────
 class DomainException(Exception): ...
-class NegativeAmountException(DomainException): ...
+class NegativeUnitPriceException(DomainException): ...
 class InvalidCurrencyException(DomainException): ...
 class CurrencyMismatchException(DomainException): ...
 class OrderAlreadyPlacedException(DomainException): ...
@@ -207,9 +213,9 @@ inventory_at_warehouse = await self._inventory.get(product_id)
 order.add_line(line=OrderLine(...), available_inventory=inventory_at_warehouse)
 ```
 
-### 4. Events on the aggregate; service drains them after the transaction
+### 4. Events on the aggregate; service drains them into the outbox
 
-The aggregate accumulates events during method calls. The service collects them with `pull_events()` after the transaction succeeds, and dispatches them via the message bus.
+The aggregate accumulates events during method calls. The service drains them with `pull_events()` *inside* the transaction and writes them to the outbox (`python-message-bus-outbox` rule 5). The events then commit with the state change, and the dispatcher delivers them at least once.
 
 ```python
 # service
@@ -224,11 +230,13 @@ async def place_order(self, cmd: PlaceOrderCommand) -> OrderGet:
             ))
         order.place()
         await self._orders.add(order)
+        for event in order.pull_events():
+            await self._outbox.add(event)              # same transaction as the state change
 
-    for event in order.pull_events():
-        await self._bus.publish(event)
     return OrderGet.from_domain(order)
 ```
+
+Publishing straight to the in-process bus *after* commit is the fire-and-forget variant. An event is lost if the process dies in between, and the call site has to catch handler failures itself, because the use case has already succeeded (see "When to break these rules" in `python-message-bus-outbox`).
 
 Events are *facts that already happened*. They're past-tense names (`OrderPlaced`, not `PlaceOrder`). They carry just enough data for handlers to act.
 
@@ -287,7 +295,7 @@ class OrderModel(Base):
 class OrderLineModel(Base):
     __tablename__ = "order_line"
 
-    id: Mapped[UUID] = mapped_column(primary_key=True)
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)   # surrogate key; the domain line has none
     order_id: Mapped[UUID] = mapped_column(ForeignKey("order.id"))
     product_id: Mapped[UUID]
     quantity: Mapped[int]
@@ -313,6 +321,8 @@ class OrderLineModel(Base):
 
 The translation methods live on the SA model (cohesion: the model knows how to bridge to/from its domain counterpart). Domain stays clean.
 
+`OrderLine` is a value object, so it has no identity and `from_domain` can't supply a primary key. The row's surrogate key must come from a column `default`; without one, the first insert fails with a NOT NULL violation on `order_line.id`.
+
 ### 6. Repos translate at the boundary
 
 ```python
@@ -337,9 +347,12 @@ class OrderRepo:
 
     async def save(self, order: Order) -> None:
         await self._session.merge(OrderModel.from_domain(order))
+        await self._session.flush()
 ```
 
 Repo returns domain objects, not models. Services work with `Order` (the domain class), never `OrderModel`.
+
+`save` is where `merge` is the right tool. It copies the freshly translated `OrderModel` onto the row loaded under the same primary key: scalar columns update in place, and the line collection is *replaced*. Old line rows are deleted (`delete-orphan`) and new ones inserted, which is correct for value-object children with no identity to preserve. Ignoring `merge`'s return value is safe here, because nothing holds the throwaway `OrderModel`; the domain `Order` is the source of truth. The trailing `flush` makes constraint violations surface inside `save`, as they do in `add`.
 
 ### 7. Schemas translate from domain, not from model
 
