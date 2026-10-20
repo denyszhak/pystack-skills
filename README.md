@@ -1,6 +1,9 @@
 # PyStack Skills
 
-![PyStack Skills Logo](assets/logo.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+  <img alt="PyStack Skills logo" src="assets/logo-light.svg" width="496">
+</picture>
 
 Opinionated agent skills for typed Python backend services.
 
